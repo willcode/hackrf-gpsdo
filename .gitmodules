@@ -1,0 +1,4 @@
+[submodule "firmware/hackrf"]
+	path = firmware/hackrf
+	url = https://github.com/willcode/hackrf.git
+	branch = hackrf-gpsdo

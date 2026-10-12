@@ -1,0 +1,9 @@
+# Build output
+build/
+build-gps/
+apps/build/
+gps/tools/build/
+__pycache__/
+*.pyc
+# Run output: the warm-start state and recordings hold the antenna's position
+gps/data/
