@@ -98,7 +98,8 @@ class TestNavC(unittest.TestCase):
         cls.exe = os.path.join(cls.tmp, "nav_check")
         src = os.path.join(HERE, "app")
         subprocess.run(["cc", "-std=gnu11", "-O2", "-Wall", "-Wextra", "-Werror", "-o", cls.exe,
-                        os.path.join(src, "gps_nav.c"), os.path.join(src, "nav_check.c"), "-lm"],
+                        os.path.join(src, "gps_nav.c"), os.path.join(src, "gps_freq.c"),
+                        os.path.join(src, "nav_check.c"), "-lm"],
                        check=True)
         cls.ephs = {}
         for prn, _, ws in WORDS:
@@ -232,6 +233,34 @@ class TestNavC(unittest.TestCase):
         np.testing.assert_allclose([got[i] for i in (0, 1, 4)], [want[i] for i in (0, 1, 4)], rtol=1e-5)
         self.assertEqual(got[2:4], [0.0, 0.0])
 
+    def test_frequency_survives_a_nan_ephemeris(self):
+        """A fifth satellite whose subframe 2 says sqrt(A) = 0 (any parity-valid subframe can be sent
+        on the air) gives a NaN expected frequency. Its NaN offset once made its variance NaN; once
+        its offset was finite again, its weight made the estimate NaN, every satellite's variance
+        followed, and no estimate reached the steering until the channels were armed again. Such an
+        ephemeris is now refused, and a non-finite offset is left out of the median and the
+        variances whatever its cause."""
+        spoof = [list(ws) for prn, _, ws in WORDS if prn == 27]
+        spoof[1][7] &= 0xFFFF00   # sqrt(A): word 8's last 8 bits, then word 9
+        spoof[1][8] = 0
+        lines = self.subframe_lines() + ["sub 40 " + " ".join(f"{w:06x}" for w in ws) for ws in spoof]
+        out = self.run_c(lines + ["eph 40", "eph 27"])
+        self.assertEqual(float(out[-2][6 + FIELDS.index("sqrta")]), 0.0)
+        self.assertEqual([out[-2][0], out[-1][0]], ["0", "1"])   # refused; the real one complete
+        tow = min(nav.field([to_bits(w, 24) for w in ws], (2, 1, 17)) for _, _, ws in WORDS)
+        _, _, rx, _, _ = self.synthetic(tow * 6.0 + 10.0, 0.0)
+        windows = []
+        for k in range(12):
+            # Channel 0 is PRN 27's carrier against the zero sqrt(A) for three windows, then
+            # against PRN 27's own ephemeris (the spoofer stopped, the next issue read).
+            sats = [(27, 40 if k < 3 else 27), (16, 16), (8, 8), (4, 4)]
+            windows.append(f"freq 0.15 {rx[0]!r} {rx[1]!r} {rx[2]!r} {tow * 6.0 + 10.0 + k!r} 4 "
+                           + " ".join(f"{m} {e}" for m, e in sats))
+        got = np.array(self.run_c(lines + windows)[len(lines):], dtype=float)
+        self.assertTrue(np.all(np.isfinite(got[:, 0])), got[:, 0])          # an estimate each
+        np.testing.assert_allclose(got[:, 0], 0.15, atol=1e-6)
+        self.assertEqual([int(u) for u in got[:, 1]], [14] * 3 + [15] * 9)  # channel 0 back
+        self.assertTrue(np.all(np.isfinite(got[:, 2:])), got[:, 2:])        # every variance
 
 if __name__ == "__main__":
     unittest.main()

@@ -68,7 +68,17 @@ int gps_nav_parity(uint32_t word, int d29, int d30, uint32_t* data);
  */
 int gps_nav_subframe(const uint32_t words[10], struct gps_eph* eph, uint32_t* tow);
 
-/* Subframes 1-3 present and from one issue of data. */
+/*
+ * The orbit a GPS satellite can have: its semi-major axis's square root (m^0.5; 5,153.6 nominal)
+ * and its eccentricity. Every field the subframes carry is bounded by its width; within these the
+ * orbit's radius is 24,000-29,000 km and every position and frequency finite. A spoofed ephemeris
+ * with sqrt(A) = 0 made the expected frequency NaN.
+ */
+#define GPS_NAV_SQRTA_MIN 5000.0
+#define GPS_NAV_SQRTA_MAX 5300.0
+#define GPS_NAV_E_MAX     0.03
+
+/* Subframes 1-3 present, from one issue of data, and their orbit within the bounds above. */
 int gps_nav_eph_complete(const struct gps_eph* eph);
 
 /*

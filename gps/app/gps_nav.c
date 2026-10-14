@@ -312,10 +312,17 @@ int gps_nav_subframe(const uint32_t ws[10], struct gps_eph* e, uint32_t* tow)
 	return id;
 }
 
+/* An orbit within gps_nav.h's bounds, in single precision: on the M4 the FPU's compares. */
+__attribute__((noinline)) static int orbit_ok(float sqrta, float e)
+{
+	return (sqrta > (float) GPS_NAV_SQRTA_MIN) && (sqrta < (float) GPS_NAV_SQRTA_MAX) &&
+		(e < (float) GPS_NAV_E_MAX);
+}
+
 int gps_nav_eph_complete(const struct gps_eph* e)
 {
 	return ((e->have & 7) == 7) && (e->iode2 == e->iode3) &&
-		(e->iode2 == (e->iodc & 0xFF));
+		(e->iode2 == (e->iodc & 0xFF)) && orbit_ok((float) e->sqrta, (float) e->e);
 }
 
 /* An almanac field: bits a to b of word w, signed when n is (n its width), times scale, in single
