@@ -535,18 +535,19 @@ static void report_fix(FILE* f)
 	if (app_message(&q, 1, r, sizeof(r)) != 128) {
 		return;
 	}
-	static const char* const results[6] = {
+	static const char* const results[7] = {
 		"kept",
 		"fewer than four usable satellites",
 		"not converged",
 		"not near the Earth",
 		"GDOP too high",
-		"three satellites with the height held: the held position until a fix"};
+		"three satellites with the height held: the held position until a fix",
+		"a satellite's range 128 m or more from the fix"};
 	const uint32_t count = get32(&r[0]);
 	if ((count == 0) || (count == last_fix.count)) {
 		printf("  fix: none (%u usable satellites; %s; %u rejected)\n",
 		       r[11],
-		       r[124] < 6 ? results[r[124]] : "?",
+		       r[124] < 7 ? results[r[124]] : "?",
 		       get32(&r[120]));
 		return;
 	}

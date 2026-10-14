@@ -523,6 +523,23 @@ static struct {
 	float fix_dop[5];
 } nav APP_STATE;
 
+/*
+ * A fix with a satellite's range residual r (m) this far from it is not kept either: |r| at least 128
+ * (2^7) or NaN, from the double's high word with its sign cleared (no library call on the M4). The
+ * ionosphere, which no model takes out, and multipath leave tens of meters at most; one wrong range
+ * (a spoofed signal, or a channel on the wrong code period) would pull the survey's mean, which the
+ * warm start then holds.
+ */
+static int residual_far(double r)
+{
+	const union {
+		double d;
+		uint64_t u;
+	} v = {.d = r};
+
+	return ((uint32_t) (v.u >> 32) << 1) >= (0x40600000u << 1);
+}
+
 /* What a tick's navigation did: 0 nothing, 1-4 a solve step (gps_nav.h), then these. */
 enum {
 	STEP_DOP = 6,   /* the DOP */
@@ -559,9 +576,16 @@ static int nav_tick(void)
 		 * looser, their error mostly the height's. */
 		const double* x = nav.s.x;
 		const double r2 = x[0] * x[0] + x[1] * x[1] + x[2] * x[2];
+		/* With four satellites, or three and the height, every residual is near 0: no satellite's
+		 * range is checked by the others. */
+		int far = 0;
+		for (int k = 0; k < nav.n; k++) {
+			far |= residual_far(nav.s.res[k]);
+		}
 		nav.result = !nav.s.converged                          ? 2 :
 			((r2 < 6.0e6 * 6.0e6) || (r2 > 6.6e6 * 6.6e6)) ? 3 :
 			!have_dop || !(dop[0] <= (nav.s.held ? 4 : 1) * MAX_GDOP) ? 4 :
+			far                                             ? 6 :
 									 0;
 		if (nav.result != 0) {
 			nav.rejected += !nav.s.held; /* the fixes that would be kept */
@@ -2044,7 +2068,8 @@ static void copy_bytes(volatile void* dst, const volatile void* src, uint32_t n)
  * healthy, 3 reading a subframe), 0, the latest HOW count (4); then fixes rejected (4) and the last
  * attempt's result: 0 kept, 1 fewer than four usable satellites, 2 not converged in ten
  * iterations, 3 not near the Earth's surface, 4 GDOP above MAX_GDOP, 5 three satellites with the
- * height held, not kept but the held position until the first kept fix.
+ * height held, not kept but the held position until the first kept fix, 6 a satellite's range 128 m
+ * or more from the fix.
  */
 static uint32_t nav_reply(void)
 {
