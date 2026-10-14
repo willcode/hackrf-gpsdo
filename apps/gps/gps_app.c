@@ -79,7 +79,7 @@
  * under what a lost lock gives. gps/freq.py's REJECT_PPB.
  */
 #define REJECT_PPB 1.0
-#define MIN_LOCK   0.5 /* symbol-sum phase lock under which a window is not used (locked 0.90-0.98) */
+#define MIN_LOCK   0.5f /* symbol-sum phase lock under which a window is not used (locked 0.90-0.98) */
 
 enum {
 	OP_ARM = 0,
@@ -145,7 +145,9 @@ struct channel {
 	uint32_t next_b;
 	uint8_t have_b;
 	uint8_t fw_hold; /* a PLL B write: the next window opened is not used either */
-	double lock_i, lock_q; /* the window's whole symbols' prompt sums, squared and summed */
+	/* The window's whole symbols' prompt sums, squared and summed: single precision serves a ratio
+	 * reported in hundredths, and on the M4 its arithmetic is the FPU's. */
+	float lock_i, lock_q;
 	struct {
 		uint32_t end; /* the grid point the window ended at */
 		uint8_t valid;
@@ -249,6 +251,21 @@ static int32_t s32(const uint16_t* w)
 
 static int32_t iabs(int32_t v)
 { return v < 0 ? -v : v; }
+
+/*
+ * The integer nearest x, half to even, mod 2^32 (|x| < 2^51): adding 1.5 * 2^52 makes the
+ * addition's own rounding do it and leaves the result in the low word. One library call on the M4,
+ * where a compare, a half and a conversion took three.
+ */
+static uint32_t nearest(double x)
+{
+	const union {
+		double d;
+		uint64_t u;
+	} v = {.d = x + 6755399441055744.0};
+
+	return (uint32_t) v.u;
+}
 
 /* ---- navigation ------------------------------------------------------------------------ */
 
@@ -372,8 +389,11 @@ static void nav_bit_end(struct channel* ch, uint32_t end)
 {
 	struct chnav* v = &ch->nav;
 	v->have_acc = 0;
-	ch->lock_i += (double) v->acc * (double) v->acc;
-	ch->lock_q += (double) v->accq * (double) v->accq;
+	/* A bit's sum is 20 periods' 28-bit sums (dsp/gps_engine.py's SUM_BITS), under 2^31.4: halved,
+	 * an int32_t the FPU converts. The lock is a ratio, which the common scale leaves alone. */
+	const float i = (float) (int32_t) (v->acc >> 1), q = (float) (int32_t) (v->accq >> 1);
+	ch->lock_i += i * i;
+	ch->lock_q += q * q;
 	nav_bit(v, v->acc < 0, end - 20);
 }
 
@@ -711,9 +731,9 @@ static int nav_tick(void)
 
 static void freq_close(struct channel* ch)
 {
-	const double tot = ch->lock_i + ch->lock_q;
+	const float tot = ch->lock_i + ch->lock_q;
 	ch->done.end = ch->next_b;
-	ch->done.lock = (tot > 0) ? (float) ((ch->lock_i - ch->lock_q) / tot) : 0.0f;
+	ch->done.lock = (tot > 0) ? (ch->lock_i - ch->lock_q) / tot : 0.0f;
 	ch->done.span = ch->fw.n_last - ch->fw.n_first;
 	ch->done.valid = !ch->fw.bad && (ch->fw.records > 500) && (ch->done.lock >= MIN_LOCK) &&
 		nav_usable(ch);
@@ -765,7 +785,7 @@ static void freq_record(struct channel* ch, uint32_t n0, uint32_t wc)
 
 static void servo_estimate(uint32_t end, double est)
 {
-	if (!servo.on || !((est < SERVO_MAX) && (est > -SERVO_MAX))) {
+	if (!servo.on || !(__builtin_fabs(est) < SERVO_MAX)) {
 		return; /* a NaN or a wild estimate never reaches PLL B */
 	}
 	const int32_t gap = (int32_t) (end - servo.end_last);
@@ -795,11 +815,14 @@ static void servo_estimate(uint32_t end, double est)
 	} else if (target < servo.target - SERVO_MAX_STEP) {
 		target = servo.target - SERVO_MAX_STEP;
 	}
-	target = (target > SERVO_MAX) ? SERVO_MAX : (target < -SERVO_MAX) ? -SERVO_MAX : target;
-	if ((target < SERVO_GAP) && (target > -SERVO_GAP)) {
+	/* Magnitudes by the sign bit, as freq.py's abs (a double's compare is a library call). */
+	if (__builtin_fabs(target) > SERVO_MAX) {
+		target = __builtin_copysign(SERVO_MAX, target);
+	}
+	if (__builtin_fabs(target) < SERVO_GAP) {
 		/* Clamped into the gap from either side, it never left it: the step limit kept the
 		 * nearest ratio at the gap's edge. */
-		target = (raw > SERVO_GAP / 2) ? SERVO_GAP : (raw < -SERVO_GAP / 2) ? -SERVO_GAP : 0;
+		target = (__builtin_fabs(raw) > SERVO_GAP / 2) ? __builtin_copysign(SERVO_GAP, raw) : 0;
 	}
 	uint32_t a = (target >= 0) ? PLL_B_NOMINAL : PLL_B_NOMINAL - 1, b, c;
 	gps_freq_fraction(
@@ -813,8 +836,7 @@ static void servo_estimate(uint32_t end, double est)
 		c = 1;
 	}
 	const double got = ((double) ((int32_t) a - PLL_B_NOMINAL) * c + b) / (PLL_B_NOMINAL * (double) c) * 1e9;
-	const double d = got - servo.target;
-	if ((d < SERVO_MIN_CHANGE) && (d > -SERVO_MIN_CHANGE)) {
+	if (__builtin_fabs(got - servo.target) < SERVO_MIN_CHANGE) {
 		return;
 	}
 	steer.a = a; /* replaces one not yet written */
@@ -1228,7 +1250,7 @@ static uint32_t arm_at(uint32_t c, uint32_t prn, uint32_t W, double fd, uint32_t
 		c,
 		prn,
 		W,
-		(uint32_t) (int32_t) (wc < 0 ? wc - 0.5 : wc + 0.5),
+		nearest(wc),
 		g1,
 		g2,
 		win,
@@ -1264,9 +1286,8 @@ static void acq_arm(int prn)
 	const double ahead = (double) (int32_t) (acq.newest + ACQ_AHEAD - acq.ref_first0) - epoch;
 	const double m = (double) (uint32_t) (ahead / period) + 1.0;
 	const double off = epoch + m * period;
-	const uint32_t start1 = acq.ref_first0 + (uint32_t) (off + 0.5);
-	if (arm_at((uint32_t) c, (uint32_t) prn, (uint32_t) (rate / GPS_ACQ_FS * TWO32 + 0.5), fd, start1) ==
-	    0) {
+	const uint32_t start1 = acq.ref_first0 + nearest(off);
+	if (arm_at((uint32_t) c, (uint32_t) prn, nearest(rate / GPS_ACQ_FS * TWO32), fd, start1) == 0) {
 		acq.armed[acq.narmed++ % CHANNELS] = (uint8_t) prn;
 		acq.pass_armed++;
 	}
@@ -2154,7 +2175,7 @@ static void steer_tick(uint32_t now)
 			      (double) steer.b) /
 		(PLL_B_NOMINAL * (double) steer.c);
 	const double w = -steer.lo_hz * delta / FS * TWO32;
-	const int32_t word = (int32_t) (w < 0 ? w - 0.5 : w + 0.5);
+	const int32_t word = (int32_t) nearest(w);
 	const int large = (word - steer.word > LARGE_STEP) || (steer.word - word > LARGE_STEP);
 	/*
 	 * A large step waits for a tick with no request outstanding, so every channel's words follow

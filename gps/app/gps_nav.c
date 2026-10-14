@@ -21,15 +21,6 @@
 
 /* ---- arithmetic */
 
-static double floor_(double x)
-{
-	const double t = (double) (int64_t) x;
-	return (t > x) ? t - 1.0 : t;
-}
-
-static double round_(double x)
-{ return floor_(x + 0.5); }
-
 double gps_nav_sqrt(double x)
 {
 	if (x <= 0) {
@@ -100,8 +91,14 @@ static double cos_kernel(double r)
  * within 20 bits); every argument here is under 100. */
 static double reduce(double x, int* quadrant)
 {
-	const double k = round_(x * (2 / PI));
-	*quadrant = (int) ((int64_t) k & 3);
+	/* k, the integer nearest x / (pi/2): adding 1.5 * 2^52 rounds it (half to even) and leaves it in
+	 * the low bits, the quadrant with it. */
+	const union {
+		double d;
+		uint64_t u;
+	} s = {.d = x * (2 / PI) + 6755399441055744.0};
+	const double k = s.d - 6755399441055744.0;
+	*quadrant = (int) (s.u & 3);
 	return (x - k * PIO2_HI) - k * PIO2_LO;
 }
 
@@ -227,8 +224,9 @@ int gps_nav_parity(uint32_t word, int d29, int d30, uint32_t* data)
 static uint32_t bits(const uint32_t* ws, int w, int a, int b)
 { return (ws[w - 1] >> (24 - b)) & ((UINT32_C(1) << (b - a + 1)) - 1); }
 
+/* An n-bit two's complement value (n up to 32), sign-extended in the integers: one conversion. */
 static double sgn(uint32_t v, int n)
-{ return (v >> (n - 1)) ? (double) v - (double) (UINT64_C(1) << n) : (double) v; }
+{ return (double) ((int32_t) (v << (32 - n)) >> (32 - n)); }
 
 /* 2^-n as a double, exactly. */
 static double p2(int n)
@@ -362,17 +360,19 @@ int gps_nav_almanac(const uint32_t ws[10], struct gps_alm alm[32])
 	return prn;
 }
 
+/* Where each of the entry's floats goes, from toa to m0, as an index from tgd in struct gps_eph (as
+ * eph_fields): one conversion in a loop, where each field's was its own library call. */
+_Static_assert(offsetof(struct gps_alm, m0) - offsetof(struct gps_alm, toa) == 7 * sizeof(float),
+	       "the eight floats from toa to m0 stand in a row");
+static const uint8_t alm_to_eph[8] = {12, 9, 16, 19, 11, 14, 18, 7};
+
 void gps_nav_alm_eph(const struct gps_alm* a, struct gps_eph* e)
 {
 	*e = (struct gps_eph){0};
-	e->toe = e->toc = a->toa;
-	e->e = a->e;
-	e->i0 = a->i0;
-	e->omegadot = a->omegadot;
-	e->sqrta = a->sqrta;
-	e->omega0 = a->omega0;
-	e->omega = a->omega;
-	e->m0 = a->m0;
+	for (int i = 0; i < 8; i++) {
+		(&e->tgd)[alm_to_eph[i]] = (&a->toa)[i];
+	}
+	e->toc = e->toe;
 	e->health = a->health;
 }
 
@@ -381,7 +381,7 @@ void gps_nav_alm_eph(const struct gps_alm* a, struct gps_eph* e)
 /* Into half a week either way; every use is within a week and a half of it. */
 static double wrap(double t)
 {
-	return (t > WEEK_S / 2) ? t - WEEK_S : (t < -WEEK_S / 2) ? t + WEEK_S : t;
+	return (__builtin_fabs(t) > WEEK_S / 2) ? t - __builtin_copysign(WEEK_S, t) : t;
 }
 
 void gps_nav_sat_position(const struct gps_eph* e, double t, double pos[3], double* clock)
@@ -470,9 +470,7 @@ static int linsolve(int n, double a[4][4], double b[4])
 	for (int c = 0; c < n; c++) {
 		int p = c;
 		for (int r = c + 1; r < n; r++) {
-			const double v = a[r][c] < 0 ? -a[r][c] : a[r][c];
-			const double w = a[p][c] < 0 ? -a[p][c] : a[p][c];
-			if (v > w) {
+			if (__builtin_fabs(a[r][c]) > __builtin_fabs(a[p][c])) {
 				p = r;
 			}
 		}

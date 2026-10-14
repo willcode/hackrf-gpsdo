@@ -140,7 +140,7 @@ void gps_freq_var_update(double* var, double r, double reject)
 	if (!finite(r)) {
 		return; /* a NaN would stay in the variance, and its weight make every estimate NaN */
 	}
-	const double c = (r > reject) ? reject : (r < -reject) ? -reject : r;
+	const double a = __builtin_fabs(r), c = (a > reject) ? reject : a; /* only c * c counts */
 	const double v = (*var == 0) ? GPS_FREQ_PRIOR_VAR : *var;
 	*var = v + (c * c - v) / GPS_FREQ_VAR_K;
 }
@@ -169,8 +169,7 @@ uint32_t gps_freq_combine(const double* ppb, const double* var, int n, double re
 	uint32_t used = 0;
 	double sum = 0, wsum = 0;
 	for (int i = 0; i < n; i++) {
-		const double d = ppb[i] - med;
-		if ((d <= reject) && (d >= -reject)) {
+		if (__builtin_fabs(ppb[i] - med) <= reject) {
 			const double w = weight(var[i]);
 			used |= 1u << i;
 			sum += w * ppb[i];

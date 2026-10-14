@@ -251,7 +251,7 @@ class TestGPSApp(unittest.TestCase):
         lo = 1575.42e6 + round(LO_OFFSET * 1e6) * 1e-6 - q
         delta = 1 / (32 * 1048575)
         w = -lo * delta / FS * 2 ** 32
-        step_word = int(w - 0.5) if w < 0 else int(w + 0.5)
+        step_word = round(w)  # half to even, as the app rounds it
         # The app's rule (as in test_arm_track_snapshot_status), with the write: asked for before
         # record STEP's tick, made at the first tick after it with no request outstanding.
         loops = li.IntLoops(FS, doppler_mhz * 1e-3, symbol_ms=20, fll_ms=300, sync_ms=1000)
@@ -316,7 +316,7 @@ class TestGPSApp(unittest.TestCase):
         delta = 3 / (32 * 1048575)
         lo = 1575.42e6 + round(LO_OFFSET * 1e6) * 1e-6 - q
         w = -lo * delta / FS * 2 ** 32
-        word = int(w - 0.5) if w < 0 else int(w + 0.5)
+        word = round(w)  # half to even, as the app rounds it
         words = np.fromfile(RUN, dtype="<u2")
         start = after_snapshots(words)
         n_first = int(words[start + 1]) | (int(words[start + 2]) << 16)
