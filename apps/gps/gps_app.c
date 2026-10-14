@@ -2038,8 +2038,9 @@ static uint32_t status_reply(void)
 		r[2] = (uint8_t) ch->loops.edge;
 		r[3] = ch->lost > 255 ? 255 : ch->lost;
 		put_u32(&r[4], ch->records);
-		/* Hz * 1000 = carrier * fs * 1000 / 2^32, fs = 4 MHz */
-		put_u32(&r[8], (uint32_t) ((ch->carrier * 4000000000LL) >> 32));
+		/* Hz * 1000 = carrier * fs * 1000 / 2^32, fs = 4 MHz, of the carrier's 32 bits as the
+		 * engine takes them: loops pulled past 2 MHz overflowed the product */
+		put_u32(&r[8], (uint32_t) (((int32_t) ch->carrier * 4000000000LL) >> 32));
 		put_u32(&r[12], (uint32_t) ch->prompt);
 	}
 	put_u32(&r[0], g.records);
