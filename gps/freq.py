@@ -222,7 +222,8 @@ def survey(z, sats, fs, step):
     for n_r in range(n_start, n_end, step):
         t_tx = [fix.transmit_time(z, s["prn"], s["subframes"][0], n_r) for s in sats]
         p, _, _, _ = nav.solve(t_tx, [s["eph"] for s in sats], max(t_tx) + 0.075)
-        pos.append(p)
+        if np.all(np.isfinite(p)):
+            pos.append(p)
     return np.mean(pos, axis=0), len(pos)
 
 

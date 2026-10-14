@@ -262,5 +262,30 @@ class TestNavC(unittest.TestCase):
         self.assertEqual([int(u) for u in got[:, 1]], [14] * 3 + [15] * 9)  # channel 0 back
         self.assertTrue(np.all(np.isfinite(got[:, 2:])), got[:, 2:])        # every variance
 
+
+class TestNavPy(unittest.TestCase):
+    def test_crafted_data_raises_nothing(self):
+        """nav.py and fix.py on data a transmitter can make: an ephemeris with sqrt(A) = 0 is not
+        plausible (sat_position divided by zero); a solve whose range is NaN gives a NaN fix
+        and no elevations (lstsq raised); three satellites, or four in a plane through the
+        receiver, give an infinite DOP (inv raised)."""
+        eph = {}
+        for prn, _, ws in WORDS:
+            if prn == 27:
+                eph.update(nav.decode_subframe([to_bits(w, 24) for w in ws]))
+        self.assertTrue(nav.plausible(eph))
+        self.assertFalse(nav.plausible(dict(eph, sqrta=0.0)))
+        self.assertFalse(nav.plausible(dict(eph, e=0.5)))
+        t = eph["toe"]
+        pos, bias, _, els = nav.solve([t, t, t, float("nan")], [eph] * 4, t + 0.075)
+        self.assertTrue(np.all(np.isnan(pos)) and np.isnan(bias))
+        self.assertIsNone(els)
+        rx = np.array([6371e3, 0.0, 0.0])
+        sats = [rx + 2e7 * np.array([1.0, np.cos(a), np.sin(a)]) for a in (0.0, 1.0, 2.0, 3.0)]
+        self.assertTrue(np.all(np.isinf(nav.dop(rx, sats[:3]))))
+        sats = [s * [1.0, 1.0, 0.0] for s in sats]           # every one in the plane z = 0
+        self.assertTrue(np.all(np.isinf(nav.dop(rx, sats))))
+
+
 if __name__ == "__main__":
     unittest.main()
