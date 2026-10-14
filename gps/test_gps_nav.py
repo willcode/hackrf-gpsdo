@@ -160,9 +160,14 @@ class TestNavC(unittest.TestCase):
 
     def test_almanac(self):
         """Each page's entry as nav.py decodes it, in single precision; the pages of other data
-        refused; and PRN 2's almanac within 3 km of its ephemeris over six hours."""
-        lines = ["alm " + " ".join(f"{w:06x}" for w in ws) for ws in PAGES]
+        refused, and a page for SV 2 with sqrt(A) = 0 (parity holds for whatever is sent), its
+        entry kept; and PRN 2's almanac within 3 km of its ephemeris over six hours."""
+        spoof = list(PAGES[1])
+        spoof[5] = 0                                            # word 6: sqrt(A)
+        lines = ["alm " + " ".join(f"{w:06x}" for w in ws) for ws in PAGES + [spoof]]
         out = self.run_c(lines)
+        self.assertEqual(out[-1], ["0"])
+        self.assertIsNone(nav.decode_almanac([to_bits(w, 24) for w in spoof]))
         prns = []
         for ws, line in zip(PAGES, out):
             want = nav.decode_almanac([to_bits(w, 24) for w in ws])

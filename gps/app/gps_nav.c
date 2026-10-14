@@ -341,14 +341,20 @@ int gps_nav_almanac(const uint32_t ws[10], struct gps_alm alm[32])
 	if (((id != 4) && (id != 5)) || (bits(ws, 3, 1, 2) != 1) || (prn < 1) || (prn > 32)) {
 		return 0;
 	}
+	/* An implausible orbit is refused, the entry left as it was: a spoofed page steers the search. */
+	const float e = alm_field(ws, 3, 9, 24, 0, (float) (1.0 / 2097152.0));
+	const float sqrta = alm_field(ws, 6, 1, 24, 0, 1.0f / 2048.0f);
+	if (!orbit_ok(sqrta, e)) {
+		return 0;
+	}
 	struct gps_alm* a = &alm[prn - 1];
 	const float sc23 = (float) (GPS_PI / 8388608.0); /* 2^-23 semicircles */
-	a->e = alm_field(ws, 3, 9, 24, 0, (float) (1.0 / 2097152.0));
+	a->e = e;
 	a->toa = alm_field(ws, 4, 1, 8, 0, 4096.0f);
 	a->i0 = (float) (0.3 * GPS_PI) + alm_field(ws, 4, 9, 24, 1, (float) (GPS_PI / 524288.0));
 	a->omegadot = alm_field(ws, 5, 1, 16, 1, (float) (GPS_PI / 274877906944.0));
 	a->health = (uint8_t) bits(ws, 5, 17, 24);
-	a->sqrta = alm_field(ws, 6, 1, 24, 0, 1.0f / 2048.0f);
+	a->sqrta = sqrta;
 	a->omega0 = alm_field(ws, 7, 1, 24, 1, sc23);
 	a->omega = alm_field(ws, 8, 1, 24, 1, sc23);
 	a->m0 = alm_field(ws, 9, 1, 24, 1, sc23);

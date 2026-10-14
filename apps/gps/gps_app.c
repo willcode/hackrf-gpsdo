@@ -1056,6 +1056,7 @@ static struct {
 	double pred_t;
 	uint8_t pred_end;
 	uint8_t predicted; /* this pass's PRNs and Dopplers from the almanac */
+	uint8_t cold;      /* this pass every PRN at every Doppler (loc_done) */
 	/* The host's GPS time (message 'W'), carried on by the M4's clock: a prediction with no
 	 * usable channel. */
 	double warm_t;
@@ -1098,7 +1099,8 @@ static uint32_t arm_channel(
  * samples past the newest seen. A pass that arms nothing, or leaves fewer than four channels
  * tracking, starts over with twice the blocks, up to ACQ_MAX_BLOCKS, the PRNs already tracked left
  * out. With an almanac a pass predicts first (acq_locate): a PRN below the horizon is left out, a
- * visible one searched at three Dopplers instead of ACQ_NDOP.
+ * visible one searched at three Dopplers instead of ACQ_NDOP. Predicted passes that reach their
+ * deepest that way are followed by one over every PRN at every Doppler (acq_pass_done).
  */
 #define ACQ_MAX_BLOCKS 64
 #define ACQ_DOPPLER 4500.0
@@ -1392,6 +1394,7 @@ static void loc_done(void)
 		}
 		acq.predicted = acq.predicted && alm[p].have && acq.loc_kept;
 	}
+	acq.cold |= !acq.loc_kept;
 	if (!acq.predicted && (acq.blocks > ACQ_MAX_BLOCKS)) {
 		acq.blocks = ACQ_MAX_BLOCKS; /* deeper only predicted (acq_pass_done) */
 	}
@@ -1582,6 +1585,11 @@ static int acq_search(void)
 		acq.ref_cell = cell;
 		acq.ref_first0 = acq.first0;
 		acq_arm(prn);
+		/* Found within the Dopplers its almanac entry gave, not at every one: the entry led to
+		 * the satellite, and the warm start keeps it for that (message 'W'). */
+		if (acq.hi[prn - 1] - acq.lo[prn - 1] < ACQ_NDOP - 1) {
+			alm[prn - 1].have = 3;
+		}
 	}
 	if (++acq.cand_i == acq.ncand) {
 		acq_pass_done();
@@ -1604,17 +1612,24 @@ static void acq_cold_pass(void)
 }
 
 /* A pass is done: idle when it armed one and four channels track (a fix's satellites), else again
- * with twice the blocks (up to the most): the satellites left are weaker than those it found. */
+ * with twice the blocks (up to the most): the satellites left are weaker than those it found. Passes
+ * the almanac narrowed that end so at the most go on to one over every PRN at every Doppler: an
+ * entry can be wrong (a spoofed page can place every satellite below the horizon, or call it
+ * unhealthy), and no entry keeps a PRN from the search for good. */
 static void acq_pass_done(void)
 {
 	int active = 0;
 	for (int c = 0; c < CHANNELS; c++) {
 		active += g.ch[c].active;
 	}
+	const int found = acq.pass_armed && (active >= 4);
 	/* A predicted pass searches about a twelfth of the cells: it goes twice as deep. */
-	if ((acq.pass_armed && (active >= 4)) ||
-	    (acq.blocks >= (acq.predicted ? 2 * ACQ_MAX_BLOCKS : ACQ_MAX_BLOCKS))) {
+	if (found || (acq.blocks >= (acq.predicted ? 2 * ACQ_MAX_BLOCKS : ACQ_MAX_BLOCKS))) {
 		acq.mode = ACQ_IDLE;
+		if (!found && !acq.cold) {
+			acq.cold = 1;
+			acq_begin(); /* loc_done brings the blocks back within ACQ_MAX_BLOCKS */
+		}
 		return;
 	}
 	acq.blocks *= 2;
@@ -1637,6 +1652,7 @@ static uint32_t acq_start(uint32_t blocks, uint32_t refine_blocks)
 	acq.code_op = 0;
 	acq.q_n = 0;
 	acq.narmed = 0;
+	acq.cold = 0;
 	acq_begin();
 	return 0;
 }
@@ -1689,7 +1705,7 @@ static void acq_begin(void)
 		acq.mode = ACQ_PREDICT;
 	}
 	/* With no almanac entry, every PRN at every Doppler (loc_done) after the grid's few seconds. */
-	if (!acq.warm || ((acq.mode == ACQ_LOCATE) && !acq.loc_n)) {
+	if (!acq.warm || ((acq.mode == ACQ_LOCATE) && !acq.loc_n) || acq.cold) {
 		acq.loc_kept = 0;
 		acq.predicted = 0;
 		loc_done();
@@ -2249,7 +2265,8 @@ static uint32_t load_reply(void)
  *   'W'                  reply: the held position (3 doubles), its state, whether the offset below
  *                        is known, and the offset (a double: a tracked satellite's loops' Doppler
  *                        less its expected carrier, in hertz)
- *   'W' prn-1            reply: that PRN's almanac entry (struct gps_alm, its bytes)
+ *   'W' prn-1            reply: that PRN's almanac entry (struct gps_alm, its bytes); its have is
+ *                        3 once a pass narrowed by it found the satellite (acq_search)
  *   'W' prn-1 entry      set it
  *   'W' t(8) offset(8)   GPS time of week now (s) and the offset: predict with no usable channel
  */

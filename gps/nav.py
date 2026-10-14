@@ -177,15 +177,16 @@ def plausible(orbit):
 def decode_almanac(ws):
     """A subframe 4 or 5 page's almanac (IS-GPS-200 20.3.3.5.1.2, Table 20-VI) as an ephemeris for
     sat_position, with the PRN and health; None for a page that holds none (data ID not 1, or an SV
-    ID outside 1-32: the pages of other data and the dummy SV 0). The terms an almanac lacks are 0,
-    its reference time stands for toe and toc, and i0 is 0.3 semicircles plus its offset."""
+    ID outside 1-32: the pages of other data and the dummy SV 0) or whose orbit is not plausible().
+    The terms an almanac lacks are 0, its reference time stands for toe and toc, and i0 is 0.3
+    semicircles plus its offset."""
     sid = field(ws, (2, 20, 22))
     prn = field(ws, (3, 3, 8))
     if sid not in (4, 5) or field(ws, (3, 1, 2)) != 1 or not 1 <= prn <= 32:
         return None
     sc = GPS_PI
     toa = field(ws, (4, 1, 8)) * 4096.0
-    return dict(
+    alm = dict(
         prn=prn, health=field(ws, (5, 17, 24)), toa=toa, toe=toa, toc=toa,
         e=field(ws, (3, 9, 24)) * 2.0 ** -21,
         i0=(0.3 + field(ws, (4, 9, 24), signed=True) * 2.0 ** -19) * sc,
@@ -197,6 +198,7 @@ def decode_almanac(ws):
         af0=field(ws, (10, 1, 8), (10, 20, 22), signed=True) * 2.0 ** -20,
         af1=field(ws, (10, 9, 19), signed=True) * 2.0 ** -38,
         af2=0.0, tgd=0.0, dn=0.0, idot=0.0, cuc=0.0, cus=0.0, crc=0.0, crs=0.0, cic=0.0, cis=0.0)
+    return alm if plausible(alm) else None
 
 
 def _wrap(t):

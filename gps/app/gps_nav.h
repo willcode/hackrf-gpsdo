@@ -89,11 +89,13 @@ int gps_nav_eph_complete(const struct gps_eph* eph);
  */
 struct gps_alm {
 	float toa, e, i0, omegadot, sqrta, omega0, omega, m0;
-	uint8_t health, have;
+	uint8_t health;
+	uint8_t have; /* 1 from a page here; the GPS app's warm start also writes 2 and 3 (gps_app.c) */
 };
 
 /* A subframe 4 or 5 page's almanac into alm[prn - 1]. Returns the PRN (1-32), or 0 for a page that
- * holds none (data ID not 1, or an SV ID outside 1-32). */
+ * holds none (data ID not 1, or an SV ID outside 1-32) or whose orbit is outside the ephemeris's
+ * bounds (alm[prn - 1] then unchanged). */
 int gps_nav_almanac(const uint32_t words[10], struct gps_alm alm[32]);
 
 /* An almanac entry as an ephemeris for gps_nav_sat_position: the terms it lacks 0 (the clock

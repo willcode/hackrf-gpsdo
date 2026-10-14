@@ -33,6 +33,7 @@ from dsp import gps_cmd, gps_engine as ge, gps_loop_int as li, gps_model as g_mo
 
 sys.path.insert(0, HERE)
 import fix, freq, nav  # noqa: E402
+from test_gps_nav import PAGES, PRN2, to_bits  # noqa: E402
 
 FS = 4e6
 M32 = 0xFFFFFFFF
@@ -483,6 +484,63 @@ class TestGPSApp(unittest.TestCase):
         self.assertLess(np.linalg.norm(x1 - x0), 1e-3)
         self.assertAlmostEqual(t1, t0, delta=1e-12)
         self.assertEqual(int.from_bytes(cutrun[-1][120:124], "little"), 0)  # none rejected
+
+    # PRN 2's almanac entry and the time it serves (2026-10-07; test_gps_nav.py's pages), every
+    # other PRN the same orbit called unhealthy: the search has PRN 2 alone to predict.
+    ALM_KEYS = ("toa", "e", "i0", "omegadot", "sqrta", "omega0", "omega", "m0")
+
+    def warm_setup(self, healthy, have, bias=0.0):
+        """The held position under PRN 2, the almanac (message 'W', entries with have as given)
+        and GPS time with the carrier offset bias; also that position and time."""
+        alm = nav.decode_almanac([to_bits(w, 24) for w in PAGES[1]])
+        t = nav.field([to_bits(w, 24) for w in PRN2[0]], (2, 1, 17)) * 6.0
+        pos = nav.sat_position(alm, t)[0]
+        rx = pos / np.linalg.norm(pos) * 6371e3
+        lines = ["m " + (b"U" + struct.pack("<3d", *rx)).hex()]
+        for prn in range(1, 33):
+            e = struct.pack("<8fBBxx", *(alm[k] for k in self.ALM_KEYS),
+                            0 if (prn == 2 and healthy) else 1, have)
+            lines.append("m " + (b"W" + bytes([prn - 1]) + e).hex())
+        lines.append("m " + (b"W" + struct.pack("<dd", t, bias)).hex())
+        return lines, alm, t, rx
+
+    def test_search_goes_cold_after_predicted_passes(self):
+        """An almanac that calls every PRN unhealthy (a spoofed page passes parity like any other):
+        the predicted passes search nothing, up to their deepest (128 blocks), and the search then
+        goes on over every PRN at every Doppler (64 blocks) instead of stopping, so no almanac
+        entry keeps a satellite from the search."""
+        lines, _, _, _ = self.warm_setup(healthy=False, have=2)
+        lines += ["m " + b"C\x08\x10".hex(), "n 2000", "m " + b"K".hex()]
+        k = self.run_app(lines)[1][-1]
+        # Cold at PRN 1's first Doppler (no snapshot comes), not predicted, at most 64 blocks.
+        self.assertEqual((k[0], k[1], k[2], k[19], k[20]), (1, 0, 0, 64, 0))
+
+    def test_search_marks_the_entry_that_found_its_satellite(self):
+        """PRN 2 synthesized at the Doppler its almanac entry predicts (with the carrier offset the
+        warm start gives): the predicted pass searches its three bins alone, finds and arms it, and
+        its entry reads back marked as having led to the satellite (have 3), which hackrf_gps keeps
+        it for, where one carried and never confirmed reads back as sent (2). One satellite is too
+        few: the predicted passes go on to their deepest, then the search goes cold."""
+        _, alm, t, rx = self.warm_setup(healthy=True, have=2)
+        doppler = 1250.0                                 # a bin's center
+        bias = doppler - freq.expected(alm, t, rx)
+        lines, _, _, _ = self.warm_setup(healthy=True, have=2, bias=bias)
+        x = g_model.synthesize(FS, 2_000_000, [dict(prn=2, code_phase=100.0, doppler=doppler,
+                                                    cn0=48.0)], seed=3)
+        iq = np.empty(2 * len(x), dtype=np.int8)
+        iq[0::2], iq[1::2] = x.real, x.imag
+        path = os.path.join(self.tmp, "prn2.iq")
+        iq.tofile(path)
+        lines = [f"e {path} 0"] + lines + ["m " + b"C\x08\x10".hex()]
+        for _ in range(12):
+            lines += ["n 500", "m " + b"K".hex()]
+        lines += ["m " + (b"W" + bytes([1])).hex(), "m " + (b"W" + bytes([2])).hex()]
+        replies = self.run_app(lines)[1]
+        k = replies[-3]
+        self.assertEqual(list(k[12:12 + k[11]]), [2])                     # PRN 2 armed
+        self.assertEqual((k[0], k[19], k[20]), (1, 64, 0))                # then cold
+        self.assertEqual(replies[-2][33], 3)                               # PRN 2's entry
+        self.assertEqual(replies[-1][33], 2)                               # PRN 3's, unchanged
 
     @unittest.skipUnless(os.path.exists(RUN), "no device run in data/")
     def test_search_from_the_almanac(self):
