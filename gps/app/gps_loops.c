@@ -109,19 +109,18 @@ static int64_t div_q14(int64_t n, int64_t d)
 	return ((n >= 0) == (d > 0)) ? q : -q;
 }
 
-/*
- * Round to nearest, half to even, as Python's round does; |v| < 2^51. Adding 1.5 * 2^52 makes the
- * addition's own rounding do it and leaves 2^51 + the result in the low 52 bits: one library call on
- * the M4, where a truncation, a difference and the compares took seven.
- */
+/* Round to nearest, half to even, as Python's round does; |v| < 2^62. No libm, for the M4 app. */
 static int64_t round_even(double v)
 {
-	const union {
-		double d;
-		uint64_t u;
-	} x = {.d = v + 6755399441055744.0};
-
-	return (int64_t) (x.u & 0xFFFFFFFFFFFFFull) - ((int64_t) 1 << 51);
+	const int64_t t = (int64_t) v; /* toward zero */
+	const double r = v - (double) t;
+	if (r > 0.5 || (r == 0.5 && (t & 1))) {
+		return t + 1;
+	}
+	if (r < -0.5 || (r == -0.5 && (t & 1))) {
+		return t - 1;
+	}
+	return t;
 }
 
 /* gains() */

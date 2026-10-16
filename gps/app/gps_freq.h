@@ -78,14 +78,13 @@ double gps_freq_expected(const double off[2], const double clk[2]);
 /*
  * The common offset over n satellites' offsets (ppb): the weighted mean of those within reject of
  * their median, var[i] each one's variance (0 for none yet). Returns the mask of those used (bit i
- * for ppb[i]); n at most 32. A NaN or infinite offset (an ephemeris that gives no expected
- * frequency) takes no part. None is within reject of the median only when they disagree (two
- * more than twice reject apart) or none is finite: 0 then, and *est is left alone.
+ * for ppb[i]); n at most 32. None is within reject of the median only when they disagree (two
+ * more than twice reject apart): 0 then, and *est is left alone.
  */
 uint32_t gps_freq_combine(const double* ppb, const double* var, int n, double reject, double* est);
 
 /* A satellite's variance after a window whose offset lay r from the estimate (r limited to
- * +-reject, as for one left out); unchanged when r is NaN or infinite. */
+ * +-reject, as for one left out). */
 void gps_freq_var_update(double* var, double r, double reject);
 
 /*

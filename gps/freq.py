@@ -106,16 +106,14 @@ class Combiner:
     """The common offset window by window, as gps_freq.c does it: the weighted mean of the
     satellites within REJECT_PPB of the median, each weighted by the inverse of its offset's recent
     variance about the estimate (PRIOR_VAR before any history, never under FLOOR^2); every usable
-    satellite's variance then follows its squared residual, limited to REJECT_PPB. A NaN or infinite
-    offset takes no part. None is used, and no variance changes, when none is within REJECT_PPB of
-    the median."""
+    satellite's variance then follows its squared residual, limited to REJECT_PPB. None is used,
+    and no variance changes, when none is within REJECT_PPB of the median."""
 
     def __init__(self):
         self.var = {}
 
     def __call__(self, offsets):
         """offsets: {key: ppb} of the usable satellites. Returns (estimate, keys used)."""
-        offsets = {k: v for k, v in offsets.items() if np.isfinite(v)}
         if not offsets:
             return np.nan, []
         med = np.median(list(offsets.values()))
@@ -222,8 +220,7 @@ def survey(z, sats, fs, step):
     for n_r in range(n_start, n_end, step):
         t_tx = [fix.transmit_time(z, s["prn"], s["subframes"][0], n_r) for s in sats]
         p, _, _, _ = nav.solve(t_tx, [s["eph"] for s in sats], max(t_tx) + 0.075)
-        if np.all(np.isfinite(p)):
-            pos.append(p)
+        pos.append(p)
     return np.mean(pos, axis=0), len(pos)
 
 

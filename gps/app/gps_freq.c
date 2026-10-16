@@ -118,17 +118,6 @@ void gps_freq_fraction(double x, uint32_t max_c, uint32_t* b, uint32_t* c)
 	*c = (uint32_t) q1; /* 1/1 when x rounds to 1: the caller takes the next integer */
 }
 
-/* Neither NaN nor infinite: an exponent not all ones (bits, not a library call, on the M4). */
-static int finite(double x)
-{
-	const union {
-		double d;
-		uint64_t u;
-	} v = {.d = x};
-
-	return ((v.u >> 52) & 0x7FF) != 0x7FF;
-}
-
 static double weight(double var)
 {
 	const double v = (var == 0) ? GPS_FREQ_PRIOR_VAR : var;
@@ -137,10 +126,7 @@ static double weight(double var)
 
 void gps_freq_var_update(double* var, double r, double reject)
 {
-	if (!finite(r)) {
-		return; /* a NaN would stay in the variance, and its weight make every estimate NaN */
-	}
-	const double a = __builtin_fabs(r), c = (a > reject) ? reject : a; /* only c * c counts */
+	const double c = (r > reject) ? reject : (r < -reject) ? -reject : r;
 	const double v = (*var == 0) ? GPS_FREQ_PRIOR_VAR : *var;
 	*var = v + (c * c - v) / GPS_FREQ_VAR_K;
 }
@@ -148,28 +134,22 @@ void gps_freq_var_update(double* var, double r, double reject)
 uint32_t gps_freq_combine(const double* ppb, const double* var, int n, double reject, double* est)
 {
 	double v[32];
-	int m = 0;
-	if (n > 32) {
+	if ((n < 1) || (n > 32)) {
 		return 0;
 	}
-	for (int i = 0; i < n; i++) { /* insertion sort of the finite offsets, for the median */
-		if (!finite(ppb[i])) {
-			continue; /* never within reject of the median below either */
-		}
-		int j = m++;
+	for (int i = 0; i < n; i++) { /* insertion sort, for the median */
+		int j = i;
 		for (; (j > 0) && (v[j - 1] > ppb[i]); j--) {
 			v[j] = v[j - 1];
 		}
 		v[j] = ppb[i];
 	}
-	if (m < 1) {
-		return 0;
-	}
-	const double med = (m & 1) ? v[m / 2] : 0.5 * (v[m / 2 - 1] + v[m / 2]);
+	const double med = (n & 1) ? v[n / 2] : 0.5 * (v[n / 2 - 1] + v[n / 2]);
 	uint32_t used = 0;
 	double sum = 0, wsum = 0;
 	for (int i = 0; i < n; i++) {
-		if (__builtin_fabs(ppb[i] - med) <= reject) {
+		const double d = ppb[i] - med;
+		if ((d <= reject) && (d >= -reject)) {
 			const double w = weight(var[i]);
 			used |= 1u << i;
 			sum += w * ppb[i];

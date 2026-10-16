@@ -79,7 +79,7 @@
  * under what a lost lock gives. gps/freq.py's REJECT_PPB.
  */
 #define REJECT_PPB 1.0
-#define MIN_LOCK   0.5f /* symbol-sum phase lock under which a window is not used (locked 0.90-0.98) */
+#define MIN_LOCK   0.5 /* symbol-sum phase lock under which a window is not used (locked 0.90-0.98) */
 
 enum {
 	OP_ARM = 0,
@@ -145,9 +145,7 @@ struct channel {
 	uint32_t next_b;
 	uint8_t have_b;
 	uint8_t fw_hold; /* a PLL B write: the next window opened is not used either */
-	/* The window's whole symbols' prompt sums, squared and summed: single precision serves a ratio
-	 * reported in hundredths, and on the M4 its arithmetic is the FPU's. */
-	float lock_i, lock_q;
+	double lock_i, lock_q; /* the window's whole symbols' prompt sums, squared and summed */
 	struct {
 		uint32_t end; /* the grid point the window ended at */
 		uint8_t valid;
@@ -251,21 +249,6 @@ static int32_t s32(const uint16_t* w)
 
 static int32_t iabs(int32_t v)
 { return v < 0 ? -v : v; }
-
-/*
- * The integer nearest x, half to even, mod 2^32 (|x| < 2^51): adding 1.5 * 2^52 makes the
- * addition's own rounding do it and leaves the result in the low word. One library call on the M4,
- * where a compare, a half and a conversion took three.
- */
-static uint32_t nearest(double x)
-{
-	const union {
-		double d;
-		uint64_t u;
-	} v = {.d = x + 6755399441055744.0};
-
-	return (uint32_t) v.u;
-}
 
 /* ---- navigation ------------------------------------------------------------------------ */
 
@@ -389,11 +372,8 @@ static void nav_bit_end(struct channel* ch, uint32_t end)
 {
 	struct chnav* v = &ch->nav;
 	v->have_acc = 0;
-	/* A bit's sum is 20 periods' 28-bit sums (dsp/gps_engine.py's SUM_BITS), under 2^31.4: halved,
-	 * an int32_t the FPU converts. The lock is a ratio, which the common scale leaves alone. */
-	const float i = (float) (int32_t) (v->acc >> 1), q = (float) (int32_t) (v->accq >> 1);
-	ch->lock_i += i * i;
-	ch->lock_q += q * q;
+	ch->lock_i += (double) v->acc * (double) v->acc;
+	ch->lock_q += (double) v->accq * (double) v->accq;
 	nav_bit(v, v->acc < 0, end - 20);
 }
 
@@ -543,23 +523,6 @@ static struct {
 	float fix_dop[5];
 } nav APP_STATE;
 
-/*
- * A fix with a satellite's range residual r (m) this far from it is not kept either: |r| at least 128
- * (2^7) or NaN, from the double's high word with its sign cleared (no library call on the M4). The
- * ionosphere, which no model takes out, and multipath leave tens of meters at most; one wrong range
- * (a spoofed signal, or a channel on the wrong code period) would pull the survey's mean, which the
- * warm start then holds.
- */
-static int residual_far(double r)
-{
-	const union {
-		double d;
-		uint64_t u;
-	} v = {.d = r};
-
-	return ((uint32_t) (v.u >> 32) << 1) >= (0x40600000u << 1);
-}
-
 /* What a tick's navigation did: 0 nothing, 1-4 a solve step (gps_nav.h), then these. */
 enum {
 	STEP_DOP = 6,   /* the DOP */
@@ -596,16 +559,9 @@ static int nav_tick(void)
 		 * looser, their error mostly the height's. */
 		const double* x = nav.s.x;
 		const double r2 = x[0] * x[0] + x[1] * x[1] + x[2] * x[2];
-		/* With four satellites, or three and the height, every residual is near 0: no satellite's
-		 * range is checked by the others. */
-		int far = 0;
-		for (int k = 0; k < nav.n; k++) {
-			far |= residual_far(nav.s.res[k]);
-		}
 		nav.result = !nav.s.converged                          ? 2 :
 			((r2 < 6.0e6 * 6.0e6) || (r2 > 6.6e6 * 6.6e6)) ? 3 :
 			!have_dop || !(dop[0] <= (nav.s.held ? 4 : 1) * MAX_GDOP) ? 4 :
-			far                                             ? 6 :
 									 0;
 		if (nav.result != 0) {
 			nav.rejected += !nav.s.held; /* the fixes that would be kept */
@@ -731,9 +687,9 @@ static int nav_tick(void)
 
 static void freq_close(struct channel* ch)
 {
-	const float tot = ch->lock_i + ch->lock_q;
+	const double tot = ch->lock_i + ch->lock_q;
 	ch->done.end = ch->next_b;
-	ch->done.lock = (tot > 0) ? (ch->lock_i - ch->lock_q) / tot : 0.0f;
+	ch->done.lock = (tot > 0) ? (float) ((ch->lock_i - ch->lock_q) / tot) : 0.0f;
 	ch->done.span = ch->fw.n_last - ch->fw.n_first;
 	ch->done.valid = !ch->fw.bad && (ch->fw.records > 500) && (ch->done.lock >= MIN_LOCK) &&
 		nav_usable(ch);
@@ -785,7 +741,7 @@ static void freq_record(struct channel* ch, uint32_t n0, uint32_t wc)
 
 static void servo_estimate(uint32_t end, double est)
 {
-	if (!servo.on || !(__builtin_fabs(est) < SERVO_MAX)) {
+	if (!servo.on || !((est < SERVO_MAX) && (est > -SERVO_MAX))) {
 		return; /* a NaN or a wild estimate never reaches PLL B */
 	}
 	const int32_t gap = (int32_t) (end - servo.end_last);
@@ -815,14 +771,11 @@ static void servo_estimate(uint32_t end, double est)
 	} else if (target < servo.target - SERVO_MAX_STEP) {
 		target = servo.target - SERVO_MAX_STEP;
 	}
-	/* Magnitudes by the sign bit, as freq.py's abs (a double's compare is a library call). */
-	if (__builtin_fabs(target) > SERVO_MAX) {
-		target = __builtin_copysign(SERVO_MAX, target);
-	}
-	if (__builtin_fabs(target) < SERVO_GAP) {
+	target = (target > SERVO_MAX) ? SERVO_MAX : (target < -SERVO_MAX) ? -SERVO_MAX : target;
+	if ((target < SERVO_GAP) && (target > -SERVO_GAP)) {
 		/* Clamped into the gap from either side, it never left it: the step limit kept the
 		 * nearest ratio at the gap's edge. */
-		target = (__builtin_fabs(raw) > SERVO_GAP / 2) ? __builtin_copysign(SERVO_GAP, raw) : 0;
+		target = (raw > SERVO_GAP / 2) ? SERVO_GAP : (raw < -SERVO_GAP / 2) ? -SERVO_GAP : 0;
 	}
 	uint32_t a = (target >= 0) ? PLL_B_NOMINAL : PLL_B_NOMINAL - 1, b, c;
 	gps_freq_fraction(
@@ -836,7 +789,8 @@ static void servo_estimate(uint32_t end, double est)
 		c = 1;
 	}
 	const double got = ((double) ((int32_t) a - PLL_B_NOMINAL) * c + b) / (PLL_B_NOMINAL * (double) c) * 1e9;
-	if (__builtin_fabs(got - servo.target) < SERVO_MIN_CHANGE) {
+	const double d = got - servo.target;
+	if ((d < SERVO_MIN_CHANGE) && (d > -SERVO_MIN_CHANGE)) {
 		return;
 	}
 	steer.a = a; /* replaces one not yet written */
@@ -1102,7 +1056,6 @@ static struct {
 	double pred_t;
 	uint8_t pred_end;
 	uint8_t predicted; /* this pass's PRNs and Dopplers from the almanac */
-	uint8_t cold;      /* this pass every PRN at every Doppler (loc_done) */
 	/* The host's GPS time (message 'W'), carried on by the M4's clock: a prediction with no
 	 * usable channel. */
 	double warm_t;
@@ -1145,8 +1098,7 @@ static uint32_t arm_channel(
  * samples past the newest seen. A pass that arms nothing, or leaves fewer than four channels
  * tracking, starts over with twice the blocks, up to ACQ_MAX_BLOCKS, the PRNs already tracked left
  * out. With an almanac a pass predicts first (acq_locate): a PRN below the horizon is left out, a
- * visible one searched at three Dopplers instead of ACQ_NDOP. Predicted passes that reach their
- * deepest that way are followed by one over every PRN at every Doppler (acq_pass_done).
+ * visible one searched at three Dopplers instead of ACQ_NDOP.
  */
 #define ACQ_MAX_BLOCKS 64
 #define ACQ_DOPPLER 4500.0
@@ -1250,7 +1202,7 @@ static uint32_t arm_at(uint32_t c, uint32_t prn, uint32_t W, double fd, uint32_t
 		c,
 		prn,
 		W,
-		nearest(wc),
+		(uint32_t) (int32_t) (wc < 0 ? wc - 0.5 : wc + 0.5),
 		g1,
 		g2,
 		win,
@@ -1286,8 +1238,9 @@ static void acq_arm(int prn)
 	const double ahead = (double) (int32_t) (acq.newest + ACQ_AHEAD - acq.ref_first0) - epoch;
 	const double m = (double) (uint32_t) (ahead / period) + 1.0;
 	const double off = epoch + m * period;
-	const uint32_t start1 = acq.ref_first0 + nearest(off);
-	if (arm_at((uint32_t) c, (uint32_t) prn, nearest(rate / GPS_ACQ_FS * TWO32), fd, start1) == 0) {
+	const uint32_t start1 = acq.ref_first0 + (uint32_t) (off + 0.5);
+	if (arm_at((uint32_t) c, (uint32_t) prn, (uint32_t) (rate / GPS_ACQ_FS * TWO32 + 0.5), fd, start1) ==
+	    0) {
 		acq.armed[acq.narmed++ % CHANNELS] = (uint8_t) prn;
 		acq.pass_armed++;
 	}
@@ -1439,7 +1392,6 @@ static void loc_done(void)
 		}
 		acq.predicted = acq.predicted && alm[p].have && acq.loc_kept;
 	}
-	acq.cold |= !acq.loc_kept;
 	if (!acq.predicted && (acq.blocks > ACQ_MAX_BLOCKS)) {
 		acq.blocks = ACQ_MAX_BLOCKS; /* deeper only predicted (acq_pass_done) */
 	}
@@ -1630,11 +1582,6 @@ static int acq_search(void)
 		acq.ref_cell = cell;
 		acq.ref_first0 = acq.first0;
 		acq_arm(prn);
-		/* Found within the Dopplers its almanac entry gave, not at every one: the entry led to
-		 * the satellite, and the warm start keeps it for that (message 'W'). */
-		if (acq.hi[prn - 1] - acq.lo[prn - 1] < ACQ_NDOP - 1) {
-			alm[prn - 1].have = 3;
-		}
 	}
 	if (++acq.cand_i == acq.ncand) {
 		acq_pass_done();
@@ -1657,24 +1604,17 @@ static void acq_cold_pass(void)
 }
 
 /* A pass is done: idle when it armed one and four channels track (a fix's satellites), else again
- * with twice the blocks (up to the most): the satellites left are weaker than those it found. Passes
- * the almanac narrowed that end so at the most go on to one over every PRN at every Doppler: an
- * entry can be wrong (a spoofed page can place every satellite below the horizon, or call it
- * unhealthy), and no entry keeps a PRN from the search for good. */
+ * with twice the blocks (up to the most): the satellites left are weaker than those it found. */
 static void acq_pass_done(void)
 {
 	int active = 0;
 	for (int c = 0; c < CHANNELS; c++) {
 		active += g.ch[c].active;
 	}
-	const int found = acq.pass_armed && (active >= 4);
 	/* A predicted pass searches about a twelfth of the cells: it goes twice as deep. */
-	if (found || (acq.blocks >= (acq.predicted ? 2 * ACQ_MAX_BLOCKS : ACQ_MAX_BLOCKS))) {
+	if ((acq.pass_armed && (active >= 4)) ||
+	    (acq.blocks >= (acq.predicted ? 2 * ACQ_MAX_BLOCKS : ACQ_MAX_BLOCKS))) {
 		acq.mode = ACQ_IDLE;
-		if (!found && !acq.cold) {
-			acq.cold = 1;
-			acq_begin(); /* loc_done brings the blocks back within ACQ_MAX_BLOCKS */
-		}
 		return;
 	}
 	acq.blocks *= 2;
@@ -1697,7 +1637,6 @@ static uint32_t acq_start(uint32_t blocks, uint32_t refine_blocks)
 	acq.code_op = 0;
 	acq.q_n = 0;
 	acq.narmed = 0;
-	acq.cold = 0;
 	acq_begin();
 	return 0;
 }
@@ -1750,7 +1689,7 @@ static void acq_begin(void)
 		acq.mode = ACQ_PREDICT;
 	}
 	/* With no almanac entry, every PRN at every Doppler (loc_done) after the grid's few seconds. */
-	if (!acq.warm || ((acq.mode == ACQ_LOCATE) && !acq.loc_n) || acq.cold) {
+	if (!acq.warm || ((acq.mode == ACQ_LOCATE) && !acq.loc_n)) {
 		acq.loc_kept = 0;
 		acq.predicted = 0;
 		loc_done();
@@ -2059,9 +1998,8 @@ static uint32_t status_reply(void)
 		r[2] = (uint8_t) ch->loops.edge;
 		r[3] = ch->lost > 255 ? 255 : ch->lost;
 		put_u32(&r[4], ch->records);
-		/* Hz * 1000 = carrier * fs * 1000 / 2^32, fs = 4 MHz, of the carrier's 32 bits as the
-		 * engine takes them: loops pulled past 2 MHz overflowed the product */
-		put_u32(&r[8], (uint32_t) (((int32_t) ch->carrier * 4000000000LL) >> 32));
+		/* Hz * 1000 = carrier * fs * 1000 / 2^32, fs = 4 MHz */
+		put_u32(&r[8], (uint32_t) ((ch->carrier * 4000000000LL) >> 32));
 		put_u32(&r[12], (uint32_t) ch->prompt);
 	}
 	put_u32(&r[0], g.records);
@@ -2090,8 +2028,7 @@ static void copy_bytes(volatile void* dst, const volatile void* src, uint32_t n)
  * healthy, 3 reading a subframe), 0, the latest HOW count (4); then fixes rejected (4) and the last
  * attempt's result: 0 kept, 1 fewer than four usable satellites, 2 not converged in ten
  * iterations, 3 not near the Earth's surface, 4 GDOP above MAX_GDOP, 5 three satellites with the
- * height held, not kept but the held position until the first kept fix, 6 a satellite's range 128 m
- * or more from the fix.
+ * height held, not kept but the held position until the first kept fix.
  */
 static uint32_t nav_reply(void)
 {
@@ -2175,7 +2112,7 @@ static void steer_tick(uint32_t now)
 			      (double) steer.b) /
 		(PLL_B_NOMINAL * (double) steer.c);
 	const double w = -steer.lo_hz * delta / FS * TWO32;
-	const int32_t word = (int32_t) nearest(w);
+	const int32_t word = (int32_t) (w < 0 ? w - 0.5 : w + 0.5);
 	const int large = (word - steer.word > LARGE_STEP) || (steer.word - word > LARGE_STEP);
 	/*
 	 * A large step waits for a tick with no request outstanding, so every channel's words follow
@@ -2312,8 +2249,7 @@ static uint32_t load_reply(void)
  *   'W'                  reply: the held position (3 doubles), its state, whether the offset below
  *                        is known, and the offset (a double: a tracked satellite's loops' Doppler
  *                        less its expected carrier, in hertz)
- *   'W' prn-1            reply: that PRN's almanac entry (struct gps_alm, its bytes); its have is
- *                        3 once a pass narrowed by it found the satellite (acq_search)
+ *   'W' prn-1            reply: that PRN's almanac entry (struct gps_alm, its bytes)
  *   'W' prn-1 entry      set it
  *   'W' t(8) offset(8)   GPS time of week now (s) and the offset: predict with no usable channel
  */

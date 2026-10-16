@@ -68,17 +68,7 @@ int gps_nav_parity(uint32_t word, int d29, int d30, uint32_t* data);
  */
 int gps_nav_subframe(const uint32_t words[10], struct gps_eph* eph, uint32_t* tow);
 
-/*
- * The orbit a GPS satellite can have: its semi-major axis's square root (m^0.5; 5,153.6 nominal)
- * and its eccentricity. Every field the subframes carry is bounded by its width; within these the
- * orbit's radius is 24,000-29,000 km and every position and frequency finite. A spoofed ephemeris
- * with sqrt(A) = 0 made the expected frequency NaN.
- */
-#define GPS_NAV_SQRTA_MIN 5000.0
-#define GPS_NAV_SQRTA_MAX 5300.0
-#define GPS_NAV_E_MAX     0.03
-
-/* Subframes 1-3 present, from one issue of data, and their orbit within the bounds above. */
+/* Subframes 1-3 present and from one issue of data. */
 int gps_nav_eph_complete(const struct gps_eph* eph);
 
 /*
@@ -89,13 +79,11 @@ int gps_nav_eph_complete(const struct gps_eph* eph);
  */
 struct gps_alm {
 	float toa, e, i0, omegadot, sqrta, omega0, omega, m0;
-	uint8_t health;
-	uint8_t have; /* 1 from a page here; the GPS app's warm start also writes 2 and 3 (gps_app.c) */
+	uint8_t health, have;
 };
 
 /* A subframe 4 or 5 page's almanac into alm[prn - 1]. Returns the PRN (1-32), or 0 for a page that
- * holds none (data ID not 1, or an SV ID outside 1-32) or whose orbit is outside the ephemeris's
- * bounds (alm[prn - 1] then unchanged). */
+ * holds none (data ID not 1, or an SV ID outside 1-32). */
 int gps_nav_almanac(const uint32_t words[10], struct gps_alm alm[32]);
 
 /* An almanac entry as an ephemeris for gps_nav_sat_position: the terms it lacks 0 (the clock

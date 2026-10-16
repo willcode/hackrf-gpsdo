@@ -64,7 +64,7 @@
  * 9. A warm start: at the end, what the app learned (its almanac, the held position once surveyed
  * or given, the carrier offset of a tracked satellite) is kept in a state file (-W; by default
  * gps/data/hackrf_gps.state; -W none for none), and at the next start, within four weeks (the
- * almanac moved to the current week; an entry that predicted its satellite wrong dropped), handed
+ * almanac moved to the current week), handed
  * back with GPS time from this computer's clock: the first search predicts the visible satellites
  * at three Dopplers each, deeper (128 blocks) in seconds, and the position seeds the survey when
  * -P gives none.
@@ -535,19 +535,18 @@ static void report_fix(FILE* f)
 	if (app_message(&q, 1, r, sizeof(r)) != 128) {
 		return;
 	}
-	static const char* const results[7] = {
+	static const char* const results[6] = {
 		"kept",
 		"fewer than four usable satellites",
 		"not converged",
 		"not near the Earth",
 		"GDOP too high",
-		"three satellites with the height held: the held position until a fix",
-		"a satellite's range 128 m or more from the fix"};
+		"three satellites with the height held: the held position until a fix"};
 	const uint32_t count = get32(&r[0]);
 	if ((count == 0) || (count == last_fix.count)) {
 		printf("  fix: none (%u usable satellites; %s; %u rejected)\n",
 		       r[11],
-		       r[124] < 7 ? results[r[124]] : "?",
+		       r[124] < 6 ? results[r[124]] : "?",
 		       get32(&r[120]));
 		return;
 	}
@@ -767,22 +766,13 @@ static void report_channels(const uint8_t* st)
 /* The app's frequency estimate ('R'), printed and written when it is new. */
 static uint32_t last_estimates;
 static float steer_in_effect; /* asked after the estimate before: it held over this one's window */
-/* The GPS PRNs (bit prn - 1) whose channel's last window was locked as the app's manager counts it
- * (symbol-sum phase lock 0.30 or more), from st, the second's status: the warm start's. */
-static uint32_t locked_prns;
 
-static void report_freq(FILE* f, const uint8_t* st)
+static void report_freq(FILE* f)
 {
 	uint8_t r[128];
 	const uint8_t q = 'R';
 	if (app_message(&q, 1, r, sizeof(r)) != 64) {
 		return;
-	}
-	for (int c = 0; c < CHANNELS; c++) {
-		const uint8_t prn = st[16 * c];
-		if ((prn >= 1) && (prn <= 32) && ((int8_t) r[52 + c] >= 30)) {
-			locked_prns |= 1u << (prn - 1);
-		}
 	}
 	static const char* const results[5] = {
 		"estimated",
@@ -1350,19 +1340,11 @@ static double ellipsoid_height(const double x[3])
  * GPS time from this computer's clock, so the first search predicts the visible satellites at
  * three Dopplers each instead of searching every PRN at every Doppler (gps_app.c, message 'W').
  * The file holds the antenna's position: it is written readable by its owner only.
- *
- * An almanac page passes parity whatever a transmitter puts in it, and an entry kept here steers the
- * first search of every later run. An entry carried into a run (sent with have 2) that comes back
- * without the app's mark of having led its search to its satellite (have 3) while that satellite
- * locked, found some other way, predicted it wrong: it is dropped. An entry whose orbit no GPS
- * satellite has is never sent. Entries otherwise age only with the file (WARM_MAX_AGE): runs can be
- * weeks apart, and a satellite below the horizon in every run is no evidence against its entry.
  */
 #define WARM_ALM_MAX 64
 /* An almanac serves acquisition for weeks; its entries are moved to the current week (alm_to_week). */
-#define WARM_MAX_AGE   (28 * 86400)
-#define ALM_HAVE       33 /* struct gps_alm's have: 1 from the sky, 2 carried, 3 led to its satellite */
-#define GPS_UTC_LEAP   18 /* GPS time less UTC since 2017 */
+#define WARM_MAX_AGE (28 * 86400)
+#define GPS_UTC_LEAP 18 /* GPS time less UTC since 2017 */
 
 struct warm {
 	time_t saved;
@@ -1371,23 +1353,6 @@ struct warm {
 	int have_alm[32];
 	uint8_t alm[32][WARM_ALM_MAX];
 };
-
-/* An entry (struct gps_alm's bytes: toa, e, i0, omegadot, sqrta, omega0, omega, m0, then health and
- * have) whose numbers are finite and whose orbit a GPS satellite can have (gps_nav.h's bounds). */
-static int alm_plausible(const uint8_t* entry, int len)
-{
-	float f[8];
-	if (len <= ALM_HAVE) {
-		return 0;
-	}
-	memcpy(f, entry, sizeof(f));
-	for (int k = 0; k < 8; k++) {
-		if (!isfinite(f[k])) {
-			return 0;
-		}
-	}
-	return (f[4] > 5000.0f) && (f[4] < 5300.0f) && (f[1] >= 0.0f) && (f[1] < 0.03f);
-}
 
 static int warm_load(const char* path, struct warm* w)
 {
@@ -1428,9 +1393,6 @@ static int warm_load(const char* path, struct warm* w)
 		}
 	}
 	fclose(f);
-	for (i = 0; i < 32; i++) {
-		w->have_alm[i] = w->have_alm[i] && alm_plausible(w->alm[i], w->alm_len);
-	}
 	return 0;
 }
 
@@ -1489,7 +1451,6 @@ static int warm_send(const struct warm* w)
 		uint8_t r[128];
 		if (w->have_alm[i]) {
 			memcpy(&msg[2], w->alm[i], w->alm_len);
-			msg[2 + ALM_HAVE] = 2; /* carried: the app marks it 3 if it leads to its satellite */
 			moved |= alm_to_week(&msg[2], w->saved);
 			n += app_message(msg, 2 + w->alm_len, r, sizeof(r)) == w->alm_len;
 		}
@@ -1510,8 +1471,7 @@ static int warm_send(const struct warm* w)
 	return w->have_bias ? n : 0;
 }
 
-/* What the app learned, over what the file held, written readable by its owner only; an entry
- * dropped as the warm start's comment says, locked_prns the satellites locked this run. */
+/* What the app learned, over what the file held, written readable by its owner only. */
 static void warm_save(const char* path, const struct warm* old)
 {
 	struct warm w = *old;
@@ -1528,21 +1488,15 @@ static void warm_save(const char* path, const struct warm* old)
 		memcpy(&w.bias, &r[26], 8);
 		w.have_bias = 1;
 	}
-	int n = 0, dropped = 0;
+	int n = 0;
 	for (int i = 0; i < 32; i++) {
 		const uint8_t m[2] = {'W', (uint8_t) i};
 		const int len = app_message(m, 2, r, sizeof(r));
 		/* struct gps_alm: eight floats, health, then have */
-		if ((len > ALM_HAVE) && (len <= WARM_ALM_MAX) && r[ALM_HAVE]) {
-			if ((r[ALM_HAVE] == 2) && ((locked_prns >> i) & 1)) {
-				w.have_alm[i] = 0;
-				dropped++;
-			} else if (alm_plausible(r, len)) {
-				memcpy(w.alm[i], r, len);
-				w.alm[i][ALM_HAVE] = 1;
-				w.alm_len = len;
-				w.have_alm[i] = 1;
-			}
+		if ((len >= 34) && (len <= WARM_ALM_MAX) && r[33]) {
+			memcpy(w.alm[i], r, len);
+			w.alm_len = len;
+			w.have_alm[i] = 1;
 		}
 		n += w.have_alm[i];
 	}
@@ -1577,15 +1531,10 @@ static void warm_save(const char* path, const struct warm* old)
 		}
 	}
 	if ((fclose(f) == 0) && (rename(tmp, path) == 0)) {
-		printf("warm-start state saved: an almanac of %d PRNs%s%s",
+		printf("warm-start state saved: an almanac of %d PRNs%s%s\n",
 		       n,
 		       w.have_pos ? ", the held position" : "",
 		       w.have_bias ? ", the carrier offset" : "");
-		if (dropped) {
-			printf(" (%d entries dropped: their satellites locked where they did not predict)",
-			       dropped);
-		}
-		printf("\n");
 	} else {
 		fprintf(stderr, "%s: cannot write the warm-start state\n", path);
 		unlink(tmp);
@@ -2319,7 +2268,7 @@ track:;
 		printf("\n");
 		report_channels(st);
 		report_fix(fix_file);
-		report_freq(freq_file, st);
+		report_freq(freq_file);
 		fflush(stdout);
 	}
 	if (fclose(fix_file) | fclose(freq_file)) {

@@ -98,8 +98,6 @@ OMEGA_E  = 7.2921151467e-5
 GPS_PI   = 3.1415926535898
 REL_F    = -4.442807633e-10
 WEEK_S   = 604800
-# The orbit a GPS satellite can have (gps_nav.h): sqrt(A) (m^0.5; 5,153.6 nominal) and eccentricity.
-SQRTA_MIN, SQRTA_MAX, E_MAX = 5000.0, 5300.0, 0.03
 
 
 def words(hard, start):
@@ -167,26 +165,18 @@ def decode_subframe(ws):
     return out
 
 
-def plausible(orbit):
-    """An ephemeris's or almanac entry's orbit within SQRTA_MIN-SQRTA_MAX and E_MAX, as gps_nav.c
-    takes them: any parity-valid subframe can be sent on the air, and sqrt(A) = 0 leaves
-    sat_position dividing by zero."""
-    return SQRTA_MIN < orbit["sqrta"] < SQRTA_MAX and orbit["e"] < E_MAX
-
-
 def decode_almanac(ws):
     """A subframe 4 or 5 page's almanac (IS-GPS-200 20.3.3.5.1.2, Table 20-VI) as an ephemeris for
     sat_position, with the PRN and health; None for a page that holds none (data ID not 1, or an SV
-    ID outside 1-32: the pages of other data and the dummy SV 0) or whose orbit is not plausible().
-    The terms an almanac lacks are 0, its reference time stands for toe and toc, and i0 is 0.3
-    semicircles plus its offset."""
+    ID outside 1-32: the pages of other data and the dummy SV 0). The terms an almanac lacks are 0,
+    its reference time stands for toe and toc, and i0 is 0.3 semicircles plus its offset."""
     sid = field(ws, (2, 20, 22))
     prn = field(ws, (3, 3, 8))
     if sid not in (4, 5) or field(ws, (3, 1, 2)) != 1 or not 1 <= prn <= 32:
         return None
     sc = GPS_PI
     toa = field(ws, (4, 1, 8)) * 4096.0
-    alm = dict(
+    return dict(
         prn=prn, health=field(ws, (5, 17, 24)), toa=toa, toe=toa, toc=toa,
         e=field(ws, (3, 9, 24)) * 2.0 ** -21,
         i0=(0.3 + field(ws, (4, 9, 24), signed=True) * 2.0 ** -19) * sc,
@@ -198,7 +188,6 @@ def decode_almanac(ws):
         af0=field(ws, (10, 1, 8), (10, 20, 22), signed=True) * 2.0 ** -20,
         af1=field(ws, (10, 9, 19), signed=True) * 2.0 ** -38,
         af2=0.0, tgd=0.0, dn=0.0, idot=0.0, cuc=0.0, cus=0.0, crc=0.0, crs=0.0, cic=0.0, cis=0.0)
-    return alm if plausible(alm) else None
 
 
 def _wrap(t):
@@ -255,15 +244,9 @@ def elevation(rx, sat):
 
 def dop(rx, sats):
     """Geometric, position, horizontal, vertical and time dilution of precision at ECEF rx for
-    satellites at the ECEF positions sats; infinite for a geometry that fixes nothing (fewer than
-    four, or in a plane through rx)."""
-    if len(sats) < 4:
-        return (np.inf,) * 5
+    satellites at the ECEF positions sats."""
     h = np.array([np.r_[-(s - rx) / np.linalg.norm(s - rx), 1.0] for s in sats])
-    try:
-        q = np.linalg.inv(h.T @ h)
-    except np.linalg.LinAlgError:
-        return (np.inf,) * 5
+    q = np.linalg.inv(h.T @ h)
     lat, lon, _ = ecef_to_geodetic(rx)
     la, lo = np.radians(lat), np.radians(lon)
     enu = np.array([[-np.sin(lo), np.cos(lo), 0],
@@ -279,9 +262,7 @@ def solve(t_tx, ephs, t_rx, iterations=10):
 
     t_tx: per satellite, the GPS time of week at which the signal received at t_rx left it (from the code
     phase). t_rx: the receiver's time of week for that instant, any guess within tens of ms. Returns the
-    ECEF position, the receiver clock bias (s, true = t_rx - bias), the residuals (m) and the elevations
-    (None when the solve never came near the Earth); a NaN position and bias when a range is not
-    finite.
+    ECEF position, the receiver clock bias (s, true = t_rx - bias), the residuals (m) and the elevations.
     """
     x = np.zeros(4)
     for it in range(iterations):
@@ -303,8 +284,6 @@ def solve(t_tx, ephs, t_rx, iterations=10):
             res.append(rho - (rng + x[3] + tropo))
             rows.append(np.r_[-(sat - x[:3]) / rng, 1.0])
         h, r = np.array(rows), np.array(res)
-        if not (np.all(np.isfinite(h)) and np.all(np.isfinite(r))):
-            return np.full(3, np.nan), np.nan, r, None
         dx = np.linalg.lstsq(h, r, rcond=None)[0]
         x += dx
         if it > 4 and np.linalg.norm(dx) < 1e-4:

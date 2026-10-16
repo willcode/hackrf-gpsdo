@@ -12,34 +12,18 @@
  *   almpos prn t                the PRN's satellite position (m) at t from its entry
  *   solve t_rx n prn t_tx ...   iterations, x, y, z, bias (m), the residuals, then the five DOPs
  *                               at the fix for the satellites' positions at t_tx
- *   freq ppb x y z t n m e ...  a frequency window as gps_app.c's freq_finish takes it (gps_freq.c),
- *                               channel i's carrier from ephemeris m and expected from e, the
- *                               oscillator ppb off: the estimate (nan for none), the mask used, then
- *                               each channel's variance, kept from window to window
  */
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-#include "gps_freq.h"
 #include "gps_nav.h"
 
 #define MAX_PRN 64
 
 static struct gps_eph ephs[MAX_PRN];
 static struct gps_alm alm[32];
-static double fvar[GPS_NAV_MAX_SV];
-
-/* The expected carrier frequency (Hz) from eph at transmit time t, received at rx. */
-static double expected(const struct gps_eph* eph, double t, const double rx[3])
-{
-	double off[2], clk[2];
-	for (int end = 0; end < 2; end++) {
-		gps_freq_end(eph, t, rx, end, &off[end], &clk[end]);
-	}
-	return gps_freq_expected(off, clk);
-}
 
 /* The line's next word, "" past its end. */
 static const char* next(char** save)
@@ -178,44 +162,6 @@ int main(void)
 			gps_nav_dop(&s, dop);
 			for (int i = 0; i < 5; i++) {
 				printf(" %.17g", dop[i]);
-			}
-			printf("\n");
-		} else if (!strcmp(cmd, "freq")) {
-			const double ppb_true = strtod(NEXT(), NULL);
-			double rx[3];
-			for (int i = 0; i < 3; i++) {
-				rx[i] = strtod(NEXT(), NULL);
-			}
-			const double t = strtod(NEXT(), NULL);
-			const int n = index_in(NEXT(), 1, GPS_NAV_MAX_SV);
-			double ppb[GPS_NAV_MAX_SV];
-			int bad = n < 0;
-			for (int k = 0; k < n; k++) {
-				const int m = index_in(NEXT(), 0, MAX_PRN - 1);
-				const int e = index_in(NEXT(), 0, MAX_PRN - 1);
-				bad |= (m < 0) || (e < 0);
-				if (!bad) {
-					const double f = expected(&ephs[m], t, rx) - GPS_FREQ_L1 * ppb_true * 1e-9;
-					ppb[k] = -(f - expected(&ephs[e], t, rx)) / GPS_FREQ_L1 * 1e9;
-				}
-			}
-			if (bad) {
-				printf("?\n");
-				fflush(stdout);
-				continue;
-			}
-			double est = 0;
-			const uint32_t used = gps_freq_combine(ppb, fvar, n, 1.0, &est);
-			if (!used || ((n > 1) && !(used & (used - 1)))) {
-				printf("nan 0");
-			} else {
-				for (int k = 0; k < n; k++) {
-					gps_freq_var_update(&fvar[k], ppb[k] - est, 1.0);
-				}
-				printf("%.17g %u", est, (unsigned) used);
-			}
-			for (int k = 0; k < n; k++) {
-				printf(" %.17g", fvar[k]);
 			}
 			printf("\n");
 		} else {

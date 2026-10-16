@@ -79,8 +79,6 @@ def satellite(z, prn):
             eph.setdefault(sf["id"], sf)
     ok = len(eph) == 3 and eph[2]["iode"] == eph[3]["iode"] == eph[1]["iodc"] & 0xFF
     merged = {**eph.get(1, {}), **eph.get(2, {}), **eph.get(3, {})} if ok else None
-    if merged is not None and not nav.plausible(merged):
-        merged = None   # parity passes for anything sent: an orbit no satellite has
     return dict(prn=prn, subframes=best, eph=merged)
 
 
@@ -163,16 +161,14 @@ def main():
     n_start = max(int(z[f"{s['prn']}_n0"][2500]) for s in sats)
     times = np.arange(n_start, n_end, int(args.step_s * fs))
     t0 = None
-    rows, kept = [], []
+    rows = []
     for n_r in times if hold is None else []:
         t_tx = [transmit_time(z, s["prn"], s["subframes"][0], n_r, deltas.get(s["prn"])) for s in sats]
         if t0 is None:
             t0 = max(t_tx) + 0.075 - n_r / fs
         t_rx = t0 + n_r / fs
         pos, bias, res, els = nav.solve(t_tx, [s["eph"] for s in sats], t_rx)
-        if np.all(np.isfinite(pos)):
-            rows.append((n_r / fs, pos, bias, res, els))
-            kept.append(n_r)
+        rows.append((n_r / fs, pos, bias, res, els))
     if hold is not None:
         t = times / fs
         held = []
@@ -184,9 +180,6 @@ def main():
             held.append(b)
         report_held(t, np.array(held))
         return
-    if not rows:
-        print(f"no solution from {len(sats)} satellites")
-        return
     pos = np.array([r[1] for r in rows])
     bias = np.array([r[2] for r in rows])
     t = np.array([r[0] for r in rows])
@@ -196,17 +189,16 @@ def main():
     print(f"\n{len(rows)} solutions from {len(sats)} satellites over {t[-1] - t[0]:.0f} s")
     print(f"position {lat:.5f}, {lon:.5f}, height {h:.0f} m; largest distance from the mean {spread:.1f} m")
     print(f"  ECEF for --hold: {mean[0]:.1f},{mean[1]:.1f},{mean[2]:.1f}")
-    if rows[0][4] is not None:   # none when the solve stayed off the Earth
-        print("elevations (deg):", " ".join(f"{s['prn']}:{e:.0f}" for s, e in zip(sats, rows[0][4])))
+    print("elevations (deg):", " ".join(f"{s['prn']}:{e:.0f}" for s, e in zip(sats, rows[0][4])))
     print("residuals at the first solution (m):", " ".join(f"{r:.1f}" for r in rows[0][3]))
-    t_tx = [transmit_time(z, s["prn"], s["subframes"][0], int(kept[0]), deltas.get(s["prn"]))
+    t_tx = [transmit_time(z, s["prn"], s["subframes"][0], int(times[0]), deltas.get(s["prn"]))
             for s in sats]
     at = [nav.sat_position(s["eph"], t)[0] for s, t in zip(sats, t_tx)]
     print("DOP at the first solution: G {:.1f}, P {:.1f}, H {:.1f}, V {:.1f}, T {:.1f}".format(
         *nav.dop(rows[0][1], at)))
     report_clock("full solution", t, bias)
     held = []
-    for n_r in kept:
+    for n_r in times:
         t_tx = [transmit_time(z, s["prn"], s["subframes"][0], n_r, deltas.get(s["prn"])) for s in sats]
         b, _ = nav.solve_clock(t_tx, [s["eph"] for s in sats], t0 + n_r / fs, mean)
         held.append(b)
