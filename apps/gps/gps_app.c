@@ -1,19 +1,37 @@
 /*
  * SPDX-License-Identifier: BSD-3-Clause
  *
- * The GPS app's M4 side: the tracking loops for the correlator in the GPS
- * image (fpga-build/top/gps_rx.py, dsp/gps_engine.py).
+ * The GPS app runs on the HackRF Pro's M4 beside the GPS image (fpga-build/top/gps_rx.py,
+ * dsp/gps_engine.py). It searches for satellites, tracks them on the image's seven correlator
+ * channels, reads their navigation messages and solves position fixes. It estimates the
+ * oscillator's frequency offset from the satellites' carriers and, when asked, steers PLL B
+ * against it. The host drives it with the messages listed below and reads its state back.
  *
- * Each tick reads the record stream from the sample buffer, where the M0
- * writes it while the image streams records (setting 0 = 1) and a receive
- * session runs. Each record goes through its channel's loops
- * (gps/app/gps_loops.c, the integer model word for word); new code and
- * carrier words go back to the engine as a pending request, written into
- * FPGA register 6 byte by byte through the firmware's register service.
+ * Tracking: each tick reads the record stream from the sample buffer, where the M0 writes it
+ * while the image streams records (setting 0 = 1) and a receive session runs. Each record goes
+ * through its channel's loops (gps/app/gps_loops.c, the integer model word for word). New code
+ * and carrier words go back to the engine as a pending request, written into FPGA register 6
+ * byte by byte through the firmware's register service.
  *
- * The host arms channels and asks for snapshots through messages; it finds
- * satellites in the snapshots. Messages (little endian), each answered with
- * one status byte (0 done, 1 busy, 2 refused) unless noted:
+ * Search (gps/app/gps_acq.c, acq_search): the app takes its own snapshots, searches them and arms
+ * the satellites it finds. The satellite manager (mgr_second) then stops a channel that stays
+ * unlocked and searches again while a channel is free. The host may also arm a channel ('A') and
+ * ask for a snapshot ('S').
+ *
+ * Navigation (gps/app/gps_nav.c): each GPS channel sums its prompt over the loops' symbol edge into
+ * bits, finds subframes by their TLM and HOW, and keeps its ephemeris and the record at which its
+ * latest subframe began. Once a second of samples the app takes every channel's transmit time at
+ * one sample index and solves for position and clock, one iteration a tick.
+ *
+ * Frequency (gps/app/gps_freq.c): each GPS channel sums the carrier cycles the engine applied over
+ * windows of a second of samples on a common grid, and gates each window on its symbol-sum phase
+ * lock. Against the held position (the mean of the first kept fixes, or one given) and the
+ * ephemeris, each satellite's carrier less its expected frequency gives the oscillator's offset;
+ * the satellites' combined offset is the estimate. The steering loop (message 'D', servo) sets
+ * PLL B, which clocks CLKOUT, against it.
+ *
+ * Messages (little endian), each answered with one status byte (0 done, 1 busy, 2 refused) unless
+ * noted:
  *   'M' v                setting 0 (output mode)
  *   'S' v                setting 1: a snapshot of (v + 1) * 1024 samples
  *   'A' ch prn W(4) Wc(4) G1(2) G2(2) win start(4) doppler(4, mHz)
@@ -27,9 +45,9 @@
  *   'B' a(4) b(4) c(4)   set PLL B's feedback ratio to a + b/c (nominal 32; see steer)
  *   'J'                  the last PLL B writes (see steer_reply)
  *   'D' on(1)            the steering loop on (1) or off (0, the ratio then held; see servo)
- *   'C' blocks refine    search for satellites and arm them (see acq_search); blocks per cold
- *                        (PRN, Doppler) and per candidate's check (at least the cold's); and from then the satellite
- *                        manager (mgr_second); 'C' 0 0 the manager alone
+ *   'C' blocks refine    start the search (see acq_search) and the satellite manager (mgr_second):
+ *                        blocks: blocks per (PRN, Doppler) in a cold pass; refine: blocks of each
+ *                        candidate's check, at least blocks; 'C' 0 0 starts the manager alone
  *   'K'                  the search's state (see acq_reply)
  *   'R'                  the oscillator's frequency offset from the carriers (see freq_reply)
  *   'U' N(4)             survey the held position over N kept fixes (default 60)
@@ -40,18 +58,6 @@
  *                        three satellites (default 0); rough 1: such a fix may replace the held
  *                        position given (a grid square's center)
  *   'W' ...              the warm start: what a run learned, read out and handed back (see warm)
- *
- * Navigation (gps/app/gps_nav.c): each GPS channel sums its prompt over the loops' symbol edge into
- * bits, finds subframes by their TLM and HOW, and keeps its ephemeris and the record at which its
- * latest subframe began. Once a second of samples the app takes every channel's transmit time at
- * one sample index and solves for position and clock, one iteration a tick.
- *
- * Frequency (gps/app/gps_freq.c): each GPS channel sums the carrier cycles the engine applied over
- * windows of a second of samples on a common grid, and gates each window on its symbol-sum phase
- * lock. Against the held position (the mean of the first kept fixes, or one given) and the
- * ephemeris, each satellite's carrier less its expected frequency gives the oscillator's offset;
- * the satellites' combined offset is the estimate. The steering loop (message 'D', servo) sets
- * PLL B, which clocks CLKOUT, against it.
  */
 
 #include <stdint.h>
@@ -74,12 +80,12 @@
 #define MAX_GDOP     50.0     /* a fix with a worse geometry is not kept */
 #define SURVEY_FIXES 60       /* kept fixes averaged into the held position */
 /*
- * A satellite whose offset is this far from the window's median is left out: locked satellites
- * agree to 0.02-0.07 ppb a second on the recordings, so 1 ppb is many times their scatter and far
- * under what a lost lock gives. gps/freq.py's REJECT_PPB.
+ * A satellite whose offset is this far from the window's median is left out. The value is many
+ * times the scatter of locked satellites and well under the error of a lost lock. It matches
+ * gps/freq.py's REJECT_PPB.
  */
 #define REJECT_PPB 1.0
-#define MIN_LOCK   0.5 /* symbol-sum phase lock under which a window is not used (locked 0.90-0.98) */
+#define MIN_LOCK   0.5 /* symbol-sum phase lock under which a window is not used (locked near 1) */
 
 enum {
 	OP_ARM = 0,
@@ -1142,13 +1148,10 @@ static void acq_request_snapshot(void)
 }
 
 /*
- * Thresholds, k / sqrt(blocks) over 1. On a 5-minute recording the best of 37 Dopplers x 1,024
- * cells for an absent PRN reached 1 + 8.4 and 7.8 / sqrt(blocks) at 8 and 16 blocks (200 and 120
- * trials; 99% under 7.8 and 7.3): the cold pass passes candidates from 8, a noise one now and then
- * (its check costs about 0.3 s). The check of
- * a candidate, one Doppler and fresh snapshots, arms over 8: on a 5-minute recording an absent
- * PRN's check reached 1 + 6.3 / sqrt(blocks) at most in 96 (32 and 64 blocks), and two satellites
- * near the cold pass's limit (about 29-31 dB-Hz) passed 92% and 98% of theirs.
+ * The detection threshold for a peak metric over the given blocks: 1 + k / sqrt(blocks). A noise
+ * cell's metric has mean 1 and scatter 1 / sqrt(blocks). The cold pass and a candidate's check
+ * both take k = 8. The cold pass lets a noise candidate through now and then. The search arms a
+ * channel only from a check, at one Doppler over fresh snapshots.
  */
 static float acq_threshold(int blocks, float k) { return 1.0f + k / __builtin_sqrtf((float) blocks); }
 
@@ -1382,7 +1385,7 @@ static void loc_point(const float* x)
 
 /* The pass from the ranges: every Doppler for a PRN without an almanac entry, and for all when no
  * point was kept (a tracked Doppler wrong: a false lock). Deeper only once the almanac is whole: a
- * PRN without one keeps every Doppler, and 128 blocks over all of them took 300 s on the box. */
+ * PRN without one keeps every Doppler, and 128 blocks over all of them take minutes. */
 static void loc_done(void)
 {
 	for (int p = 0; p < 32; p++) {
@@ -1575,8 +1578,8 @@ static int acq_search(void)
 		}
 		return STEP_ACQ_CORR;
 	}
-	/* One Doppler, the cold pass's: 11 steps of 25 Hz across the bin cost 11 times the time,
-	 * detected no more on a 5-minute recording, and picked noise for the Doppler. */
+	/* The check runs at one Doppler, the cold pass's. Steps of 25 Hz across the bin would cost
+	 * 11 times the time and can pick noise for the Doppler. */
 	if (m >= acq_threshold(acq_refine_blocks(), 8.0f)) {
 		acq.ref_doppler = acq.doppler;
 		acq.ref_cell = cell;
@@ -1748,9 +1751,9 @@ static int acq_tick(void)
  * pull-in, is kept while its loops' Doppler stays within MGR_HELD Hz of its last locked second's,
  * plus 1 Hz a second unlocked (a satellite's Doppler moves under 1 Hz a second), up to MGR_HOLD
  * seconds; then stopped. Settled loops hold a fading satellite's frequency below the lock gate
- * and often lock again; a re-arm restarted the loops' pull-in, which wandered off a weak signal
- * in a second (none of six re-arms held, on the box). While a channel is free and the search
- * idle, a pass over the PRNs not tracked starts MGR_AGAIN seconds after the last.
+ * and often lock again. A re-arm restarts the loops' pull-in, which wanders off a weak signal in a
+ * second. While a channel is free and the search idle, a pass over the PRNs not tracked starts
+ * MGR_AGAIN seconds after the last.
  */
 #define MGR_LOCK   30 /* hundredths */
 #define MGR_SETTLE 15
@@ -1875,9 +1878,9 @@ static void read_stream(void)
 	const volatile uint16_t* words = (const volatile uint16_t*) APP_SAMPLES; /* pos stays even */
 	for (uint32_t i = 0; (i < MAX_WORDS) && (avail >= 2); i++, avail -= 2) {
 		if (g.snap_skip > 3) {
-			/* Inside a snapshot: its samples stay in the ring for the search (acq_snap_start),
-			 * so pass them at once, up to the trailer's three words. Word by word, 4,096 a
-			 * block cost the search's ticks about 0.1 ms each (measured). */
+			/* Inside a snapshot: its samples stay in the ring for the search (acq_snap_start).
+			 * The loop passes them in one step, up to the trailer's three words. Word by word,
+			 * each block's 4,096 words would take time from the search's ticks. */
 			uint32_t k = g.snap_skip - 3;
 			k = (k < avail / 2) ? k : avail / 2;
 			g.snap_skip -= k;
