@@ -1,79 +1,11 @@
 /*
  * SPDX-License-Identifier: BSD-3-Clause
  *
- * hackrf_gps: monitor a HackRF Pro running the GPS image (fpga-build/top/gps_rx.py) and the GPS
- * app (apps/gps/gps_app.c), both loaded into RAM at the start. The box does the work: it searches
- * for satellites, arms and tracks them, drops and replaces them, solves fixes and measures its
- * oscillator. This tool sets it up and prints what it reports.
- *
- * 0. Switches the HackRF to GPS: stops any app, loads the GPS image and starts the GPS app over USB
- * (-G and -A name them; by default the repository's own, found from this program's place in it;
- * -N keeps what is loaded), and prints how long that took. At the end it switches back: the app
- * stopped and stock image 0 loaded from flash, so the stock tools work at once (-K keeps GPS).
- * 1. Sets the radio to L1 at 4 Msps and streams; the image sends records
- * (setting 0 = 1).
- * 2. Gives the app the tuner's offset and quarter shift ('F') and the held position ('U').
- * 3. Starts the search on the box ('C'): the app takes its own snapshots, searches them, arms the
- * satellites it finds, and from then on its manager keeps a channel that loses lock while its loops
- * stay near its last Doppler (up to 60 s), stops it otherwise, and searches again while a channel is
- * free. Its progress ('K') is printed once a second until a
- * pass arms a satellite, for at most -S seconds (default 120).
- * 4. Prints the app's status once a second (every tracking channel, with its PRN, and a line for
- * each channel armed, re-armed or stopped), with the M4's load: the main loop's passes a second
- * against the count before any channel was armed. With -o out.bin, the stream (records and
- * snapshots) is saved there.
- * 5. Prints the app's fix once a second when it has one (satellites, GDOP, GPS
- * time of week, the sample clock's offset from the fix before, and the distance
- * from the first fix), and with -o writes each fix to out.bin.fix: sample index, GPS
- * time of week, ECEF x, y, z (m), satellites and GDOP. The position is printed
- * nowhere else.
- * 6. Prints the app's estimate of the oscillator's frequency offset once a
- * second, from the satellites' carriers against a held position: the mean of
- * the first 60 kept fixes, or the ECEF position given with -P x,y,z (meters),
- * or with -P a previous run's out.bin.fix, the mean of its fixes: with fewer
- * than four satellites there is no fix to survey, and one satellite then
- * suffices. -P with a grid square (FN20xr, 4 to 10 characters, optionally
- * ",height" in meters) starts the survey from its center: one satellite gives
- * an estimate at once (a 6-character square within about 2 ppb), and the
- * search predicts from the almanac before the survey ends. Until the first
- * kept fix, three satellites give a fix with the height held (-E, meters above
- * the WGS 84 ellipsoid, which lies within about 100 m of sea level; default 0;
- * a grid square's height or the warm start's position's
- * when given) and it is the held position: per km of height error, the estimate
- * is off a median 0.1 ppb (0.28 at the 90th percentile). With no position at
- * all, once the almanac is read (12.5 minutes of data, or a warm start's), a
- * search narrows itself from the tracked satellites' Dopplers: it searches only
- * the PRNs and Doppler bins seen from where those Dopplers agree.
- * With -o, each estimate goes to out.bin.freq: the sample index its second of samples
- * ended at, the estimate and the used satellites' rms about it (ppb), the
- * channels used and usable (bit masks), the held position's state (1
- * surveying, 2 surveyed, 3 given), then per channel its offset (ppb, nan
- * where not usable) and symbol-sum phase lock, then PLL B's steering (ppb) as
- * asked after this estimate: it holds over the next window, so CLKOUT's error
- * over a window is its estimate plus the line before's steering (the printed
- * CLKOUT figure pairs them so).
- *
- * 7. With -B, sets PLL B's feedback ratio a + b/c at the given seconds of
- * tracking (nominal 32; the app folds each step into every carrier word, and
- * the firmware keeps it within 5 ppm). PLL B clocks CLKOUT and the RF
- * references. Each write is printed from the app's log ('J'); a run that
- * leaves PLL B off 32 puts it back at its end, Ctrl-C included.
- * 8. With -D t, turns the app's steering loop on at second t of tracking: PLL B
- * follows the TCXO's predicted error each second, so CLKOUT's error is the
- * TCXO's less its prediction; the loop is turned off at the end.
- * 9. A warm start: at the end, what the app learned (its almanac, the held position once surveyed
- * or given, the carrier offset of a tracked satellite) is kept in a state file (-W; by default
- * gps/data/hackrf_gps.state; -W none for none), and at the next start, within four weeks (the
- * almanac moved to the current week), handed
- * back with GPS time from this computer's clock: the first search predicts the visible satellites
- * at three Dopplers each, deeper (128 blocks) in seconds, and the position seeds the survey when
- * -P gives none.
- * 10. With -H, the search runs here instead of on the box, as a reference: K snapshots of 32 ms
- * (-k, default 6) 100 ms apart are searched as gps_model.acquire_all does (+-6 kHz in 250 Hz bins,
- * 1 ms blocks summed noncoherently, the same threshold and cross-correlation rule), each detection
- * searched again in K fresh snapshots within 250 Hz in 25 Hz steps, and up to seven channels armed
- * at a code epoch about a second ahead. -n fills up to n channels with the next-best PRNs, as a
- * load test; -c the first channel. This is the host's heavy part: seconds of CPU per snapshot.
+ * hackrf_gps runs a HackRF Pro as a GPS frequency reference. It loads the GPS image
+ * (fpga-build/top/gps_rx.py) and the GPS app (apps/gps/gps_app.c) into RAM and sets them up. It
+ * then prints what the app reports once a second: the channels, the fix and the oscillator's
+ * frequency offset. With -B or -D it steers PLL B, which clocks CLKOUT and the RF references. The
+ * app does the search, the tracking, the fixes and the estimate on the board.
  *
  *   hackrf_gps [-o out.bin] [-t seconds] [-l lna] [-g vga] [-a amp] [-p antenna_power]
  *              [-P x,y,z | -P run.fix | -P grid[,height]] [-E height] [-B t:a,b,c;t:a,b,c...]
@@ -82,22 +14,88 @@
  *              [-H [-k snapshots] [-n channels] [-c first_channel]]
  *   hackrf_gps -f recording.iq [-k snapshots] [-s offset_ms]
  *
- * -t 0 runs until Ctrl-C (default 60 s). -h prints every option.
+ * -h prints every option. -t sets the seconds of tracking (default 60); -t 0 runs until Ctrl-C.
+ * -p 1 powers an active antenna; turn it on only when that antenna is the only thing on the port.
+ * The RF amplifier is on by default (-a 1): without it the receiver's own noise swamps an active
+ * antenna's output.
  *
- * The second form runs the search alone, on K slices 100 ms apart of a
- * recording of 8-bit I/Q at 4 Msps (hackrf_transfer's format); no device.
+ * The tool runs on the one HackRF Pro whose firmware takes apps. It leaves any other HackRF alone,
+ * and it refuses to start when two such Pros are attached.
  *
- * The RF amplifier is on by default (-a 1): without it the receiver's own
- * noise swamps an active antenna's output, about 6 dB lost in the search. Antenna
- * power (-p 1) only with an active antenna as the only thing on the port.
+ * A run, in order:
+ * 1. Switches the board to GPS: stops any app, loads the image and the app over USB, and prints how
+ *    long that took. -G and -A name the files. The defaults are the repository's own, found from
+ *    this program's place in it. -N keeps what is loaded.
+ * 2. Tunes to L1 at 4 Msps, sets the image to send records (setting 0 = 1) and starts receiving.
+ * 3. Sends the app the tuner's offset and quarter shift ('F'), the height a three-satellite fix
+ *    holds ('H') and the held position or its survey ('U').
+ * 4. Starts the search on the box ('C'). The app takes its own snapshots, searches them and arms
+ *    the satellites it finds. Its manager then keeps or stops each channel and searches again while
+ *    a channel is free. The search's progress ('K') is printed once a second until a pass arms a
+ *    satellite, for at most -S seconds (default 120).
+ * 5. Tracks for -t seconds. Each second it prints the app's status ('Q'): every tracking channel
+ *    with its PRN, a search under way, and the M4's load. The load compares the main loop's passes
+ *    a second with the count before any channel was armed. A line follows for each channel armed,
+ *    re-armed or stopped. The fix ('P') and the frequency estimate ('R') follow, or the reason
+ *    there is none.
+ * 6. Ends at -t, Ctrl-C, SIGTERM or SIGHUP alike. It saves the warm start, turns the steering loop
+ *    off if it ran, puts PLL B back to nominal if the run moved it, stops the channels, turns
+ *    antenna power off and stops receiving. It then stops the app and loads stock image 0 from
+ *    flash, and the stock tools work at once. -K keeps GPS loaded.
+ *    A process killed outright leaves the radio receiving with antenna power on, until the next
+ *    stop or USB reconfiguration.
  *
- * It runs on the one HackRF Pro whose firmware takes apps; another HackRF (a One clocked from the
- * Pro's CLKOUT, or a Pro on stock firmware) is left alone, and two such Pros are refused.
+ * The frequency estimate compares each satellite's carrier with the one expected at a held
+ * position. With a position held, one satellite gives an estimate. The held position is one of:
+ * - -P x,y,z: an ECEF position in meters.
+ * - -P run.fix: the mean of the fixes in a previous run's .fix file.
+ * - a survey: the mean of the first 60 kept fixes. A kept fix needs four satellites.
+ * - -P grid[,height]: a Maidenhead square's center (4 to 10 characters, such as FN20xr), held
+ *   until the survey's first kept fix. The search predicts from the almanac from the start.
+ * - the warm start's position, held the same way as a grid square's center.
+ * Until the first kept fix, a fix from three satellites holds the height and serves as the held
+ * position. It replaces a grid square's center; a warm start's position stays. -E gives that
+ * height in meters above the WGS 84 ellipsoid, which lies within about 100 m of sea level. The
+ * default is 0, or the grid square's or the warm start's height.
  *
- * Ctrl-C (or SIGTERM, SIGHUP) ends the run through the same cleanup as its end:
- * the channels stopped, antenna power off, receiving stopped. A process killed
- * outright leaves the radio receiving with antenna power on, until the next
- * stop or USB reconfiguration.
+ * With no position at all, a search narrows itself once the almanac is read (12.5 minutes of data,
+ * or the warm start's). It searches only the PRNs and Doppler bins visible from where the tracked
+ * satellites' Dopplers agree.
+ *
+ * With -o out.bin the tool writes three files:
+ * - out.bin: the stream as received, records and snapshots.
+ * - out.bin.fix: a line per fix: sample index, GPS time of week, ECEF x, y, z (m), satellites and
+ *   GDOP. The printed output carries no position.
+ * - out.bin.freq: a line per estimate: the sample index its second of samples ended at, the
+ *   estimate and the used satellites' rms about it (ppb), the channels used and usable (bit
+ *   masks), the held position's state (0 none, 1 surveying, 2 surveyed, 3 given), each channel's
+ *   offset (ppb, nan where not usable), each channel's symbol-sum phase lock, and the PLL B
+ *   steering asked after this estimate (ppb). That steering holds over the next line's window:
+ *   CLKOUT's error in a line is its estimate plus the line before's steering.
+ *
+ * -B t:a,b,c;... sets PLL B's feedback ratio to a + b/c at second t of tracking (nominal 32), for
+ * testing steps. The firmware keeps the ratio within 5 ppm of nominal. Each write is printed from
+ * the app's log ('J').
+ * -D t turns the app's steering loop on at second t of tracking. PLL B then follows the TCXO's
+ * predicted error each second: CLKOUT's error is the TCXO's less its prediction.
+ *
+ * The warm start (-W, default gps/data/hackrf_gps.state; -W none for none) keeps what the app
+ * learned: its almanac, the held position once surveyed or given, and the carrier offset of a
+ * tracked satellite. A run within four weeks hands it back with GPS time from this computer's
+ * clock and the almanac moved to the current week. With a held position and the carrier offset,
+ * the first search predicts the visible satellites at three Dopplers each, at 128 blocks.
+ *
+ * -H runs the search on the host instead of the box, as a reference. It takes K snapshots of 32 ms
+ * (-k, default 6) 100 ms apart and searches them as gps_model.acquire_all does: +-6 kHz in 250 Hz
+ * bins, 1 ms blocks summed noncoherently, with its threshold and cross-correlation rule. It
+ * searches each detection again in K fresh snapshots, within 250 Hz in 25 Hz steps. It arms up to
+ * seven channels at a code epoch about a second ahead. -n fills up to n channels with the
+ * next-best PRNs, as a load test; -c names the first channel. This search takes seconds of CPU per
+ * snapshot.
+ *
+ * The second form runs that search alone on a recording of 8-bit I/Q at 4 Msps, as
+ * hackrf_transfer writes it. It takes K slices 100 ms apart from -s milliseconds in (default 100)
+ * and prints the arms a live run would send. It opens no device.
  */
 
 #include <complex.h>
@@ -2014,10 +2012,11 @@ int main(int argc, char** argv)
 		}
 		gps_running = 1;
 	}
-	/* Cold, 8 blocks (about 14 s a pass) find satellites of about 35 dB-Hz and up; a pass that
-	 * arms nothing goes on at twice the blocks. A whole almanac with a position and the carrier
-	 * offset: every pass a predicted one (about 8 PRNs at 3 Dopplers), affordable at 128 blocks
-	 * (about 8 s), which finds the weak satellites a cold pass misses. */
+	/* The first search's blocks per PRN and Doppler. A cold pass over 8 finds the strong
+	 * satellites, and a pass that arms nothing goes on at twice the blocks. A warm start with a
+	 * whole almanac, a position and the carrier offset makes every pass a predicted one (about 8
+	 * PRNs at 3 Dopplers). Such a pass is short enough at 128 blocks to find the weak satellites a
+	 * cold pass misses. */
 	int first_blocks = 8;
 	if (warm_have && (warm_send(&warm) == 32) && have_held) { /* 32 only with the offset */
 		first_blocks = 128;
@@ -2027,8 +2026,8 @@ int main(int argc, char** argv)
 	if (!host_search) {
 		/* The search on the box (gps_app.c, 'C'), progress once a second ('K'). */
 		measure_base_rate(&base_rate);
-		/* Each candidate checked over at least 64 blocks: on a 5-minute recording a
-		 * satellite near the cold pass's limit passed 98% of its checks there, 92% over 32. */
+		/* Each candidate is checked over at least 64 blocks. A satellite near the cold pass's
+		 * limit passes its check more often over 64 blocks than over 32. */
 		uint8_t k[128] = {0};
 		const uint8_t kq = 'K';
 		if (!load && (app_message(&kq, 1, k, sizeof(k)) >= 21) && k[0]) {
